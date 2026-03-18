@@ -74,6 +74,61 @@ class WaveletDefense:
         self.client_overhead = {}
         self.current_epoch = 0  # 添加当前轮次记录
 
+    def extract_feature_differences(self, original_updates, probed_updates):
+        """
+        提取原始更新与诱导更新之间的频域差分特征。
+
+        Args:
+            original_updates: 原始客户端更新 [num_clients, update_dim]
+            probed_updates: 诱导后的客户端更新 [num_clients, update_dim]
+
+        Returns:
+            np.ndarray: 差分特征矩阵 [num_clients, num_features]
+        """
+        feature_vectors = []
+
+        for i, (orig_update, probed_update) in enumerate(zip(original_updates, probed_updates)):
+            orig_coeffs = self.wavelet_transform(orig_update)
+            orig_features = self.extract_wavelet_features(orig_coeffs)
+
+            probed_coeffs = self.wavelet_transform(probed_update)
+            probed_features = self.extract_wavelet_features(probed_coeffs)
+
+            feature_diff = np.abs(probed_features - orig_features)
+            if np.isnan(feature_diff).any() or np.isinf(feature_diff).any():
+                print(f"客户端 {i} 的特征包含无效值，使用零替代")
+                feature_diff = np.zeros_like(feature_diff)
+
+            feature_vectors.append(feature_diff)
+
+        return np.array(feature_vectors)
+
+    def estimate_benign_feature_prototype(self, client_updates, probed_updates, benign_indices=None):
+        """
+        估计良性客户端在防御特征空间中的原型向量。
+
+        Args:
+            client_updates: 原始客户端更新
+            probed_updates: 诱导后的客户端更新
+            benign_indices: 良性客户端索引；若为None，则使用全部客户端
+
+        Returns:
+            np.ndarray: 良性原型特征
+        """
+        feature_vectors = self.extract_feature_differences(client_updates, probed_updates)
+        if len(feature_vectors) == 0:
+            return np.array([])
+
+        if benign_indices is None:
+            benign_vectors = feature_vectors
+        else:
+            benign_vectors = feature_vectors[benign_indices]
+
+        if len(benign_vectors) == 0:
+            return np.array([])
+
+        return np.mean(benign_vectors, axis=0)
+
     def record_client_overhead(self, client_id, compute_time, model_size_kb):
         """
         记录客户端的计算和通信开销
@@ -1460,28 +1515,8 @@ class WaveletDefense:
         """
         start_time = time.time()
         try:
-            feature_vectors = []
+            feature_vectors = self.extract_feature_differences(original_updates, probed_updates)
             normalized_feature_vectors = []
-
-            # 为每个客户端提取特征
-            for i, (orig_update, probed_update) in enumerate(zip(original_updates, probed_updates)):
-                # 计算原始更新的小波特征
-                orig_coeffs = self.wavelet_transform(orig_update)
-                orig_features = self.extract_wavelet_features(orig_coeffs)
-
-                # 计算诱导后更新的小波特征
-                probed_coeffs = self.wavelet_transform(probed_update)
-                probed_features = self.extract_wavelet_features(probed_coeffs)
-
-                # 计算特征差异并归一化
-                feature_diff = np.abs(probed_features - orig_features)
-
-                # 检查特征是否包含无效值
-                if np.isnan(feature_diff).any() or np.isinf(feature_diff).any():
-                    print(f"客户端 {i} 的特征包含无效值，使用零替代")
-                    feature_diff = np.zeros_like(feature_diff)
-
-                feature_vectors.append(feature_diff)
 
             # 标准化特征
             if len(feature_vectors) > 0:

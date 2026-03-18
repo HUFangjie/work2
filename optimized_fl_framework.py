@@ -62,8 +62,11 @@ class FLConfig:
     num_local_epochs: int = 1  # 每个客户端本地训练轮数
 
     # 攻击配置
-    attack_type: str = "fang"  # 'lie', 'fang', 'agr', 'min-max', 'min-sum'
+    attack_type: str = "fang"  # 'lie', 'fang', 'agr', 'min-max', 'min-sum', 'adaptive'
     deviation_type: str = "unit_vec"  # 'unit_vec', 'sign', 'std'
+    adaptive_attack_weight: float = 0.5
+    adaptive_scale_candidates: Tuple[float, ...] = (0.5, 1.0, 2.0, 5.0, 10.0)
+    attack_debug_enabled: bool = True
 
     # 防御配置
     defense_enabled: bool = True
@@ -86,7 +89,7 @@ class FLConfig:
     def __post_init__(self):
         """执行验证并设置派生参数"""
         # 验证攻击类型
-        valid_attack_types = ['lie', 'fang', 'agr', 'min-max', 'min-sum']
+        valid_attack_types = ['lie', 'fang', 'agr', 'min-max', 'min-sum', 'adaptive']
         if self.attack_type not in valid_attack_types:
             raise ValueError(f"无效的攻击类型: {self.attack_type}. 有效类型: {valid_attack_types}")
 
@@ -106,6 +109,15 @@ class FLConfig:
 
         # 设置设备
         self.device = torch.device("cuda" if torch.cuda.is_available() and self.use_gpu else "cpu")
+
+
+@dataclass
+class AttackContext:
+    """攻击构造所需的上下文，便于复用与调试。"""
+    defender: Optional[WaveletDefense] = None
+    benign_feature_prototype: Optional[np.ndarray] = None
+    epoch_num: int = 0
+    debug_store: Optional[List[Dict[str, Any]]] = None
 
 
 # =========================================================
@@ -665,7 +677,7 @@ class AttackFactory:
     """攻击策略工厂类"""
 
     @staticmethod
-    def create_attack(attack_type: str, config: FLConfig) -> Callable:
+    def create_attack(attack_type: str, config: FLConfig, attack_context: Optional[AttackContext] = None) -> Callable:
         """创建指定类型的攻击函数
 
         Args:
@@ -694,6 +706,10 @@ class AttackFactory:
         elif attack_type == 'min-sum':
             return lambda all_updates, model_re, n_attackers: AttackFactory.min_sum_attack(
                 all_updates, model_re, n_attackers, config.deviation_type, config.device
+            )
+        elif attack_type == 'adaptive':
+            return lambda all_updates, model_re, n_attackers: AttackFactory.adaptive_attack(
+                all_updates, model_re, n_attackers, config, attack_context
             )
         else:
             raise ValueError(f"不支持的攻击类型: {attack_type}")
@@ -1134,6 +1150,71 @@ class AttackFactory:
         except Exception as e:
             print(f"MIN-SUM攻击生成失败: {str(e)}")
             # 出错时生成一个安全的恶意更新
+            return -0.2 * model_re.detach().clone()
+
+    @staticmethod
+    def adaptive_attack(all_updates: torch.Tensor, model_re: torch.Tensor,
+                        n_attackers: int, config: FLConfig,
+                        attack_context: Optional[AttackContext]) -> torch.Tensor:
+        """
+        防御感知自适应攻击：
+        在原有投毒目标与防御特征伪装目标之间做折中，便于后续比较实验。
+        """
+        try:
+            if len(all_updates) == 0:
+                return -0.2 * model_re.detach().clone()
+
+            deviation = AttackFactory.get_deviation_vector(model_re, all_updates, config.deviation_type)
+            deviation_norm = torch.norm(deviation)
+            if deviation_norm.item() == 0:
+                deviation = torch.sign(model_re)
+                deviation_norm = torch.norm(deviation) + 1e-12
+            deviation = deviation / (deviation_norm + 1e-12)
+
+            benign_mean = torch.mean(all_updates, dim=0)
+            baseline_distance = torch.norm(model_re - benign_mean) + 1e-12
+            best_candidate = None
+            best_score = None
+            candidate_debug = []
+
+            for scale in config.adaptive_scale_candidates:
+                candidate = model_re - float(scale) * deviation * baseline_distance
+                poison_score = torch.norm(candidate - benign_mean).item()
+                evade_distance = 0.0
+
+                if attack_context and attack_context.defender and attack_context.benign_feature_prototype is not None:
+                    defender = attack_context.defender
+                    with torch.no_grad():
+                        candidate_updates = torch.stack([candidate.detach()])
+                        candidate_probed = defender.generate_probing_parameters(candidate_updates)
+                        candidate_features = defender.extract_feature_differences(
+                            candidate_updates, candidate_probed
+                        )
+
+                    if len(candidate_features) > 0 and len(attack_context.benign_feature_prototype) > 0:
+                        evade_distance = float(np.linalg.norm(
+                            candidate_features[0] - attack_context.benign_feature_prototype
+                        ))
+
+                total_score = poison_score - config.adaptive_attack_weight * evade_distance
+                candidate_debug.append({
+                    "epoch": attack_context.epoch_num if attack_context else -1,
+                    "scale": float(scale),
+                    "poison_score": float(poison_score),
+                    "evasion_distance": float(evade_distance),
+                    "total_score": float(total_score)
+                })
+
+                if best_score is None or total_score > best_score:
+                    best_score = total_score
+                    best_candidate = candidate
+
+            if attack_context and attack_context.debug_store is not None and config.attack_debug_enabled:
+                attack_context.debug_store.extend(candidate_debug)
+
+            return best_candidate if best_candidate is not None else (-0.2 * model_re.detach().clone())
+        except Exception as e:
+            print(f"自适应攻击生成失败: {str(e)}")
             return -0.2 * model_re.detach().clone()
 
 
@@ -2125,11 +2206,9 @@ class FederatedLearning:
             'best_val_acc': 0,
             'best_test_acc': 0,
             'defense_stats': [],
-            'lr': []
+            'lr': [],
+            'attack_debug': []
         }
-
-        # 创建攻击函数
-        attack_fn = AttackFactory.create_attack(at_type, self.config)
 
         # 主训练循环
         epoch_num = 0
@@ -2268,13 +2347,33 @@ class FederatedLearning:
                 # 计算良性客户端的平均参数向量
                 if len(benign_models_params) > 0:
                     benign_updates = torch.stack(benign_models_params)
-                    agg_params = torch.mean(benign_updates, 0)
 
                     # 提取当前全局模型参数
                     global_params = []
                     for param in fed_model.parameters():
                         global_params.append(param.data.view(-1))
                     global_params = torch.cat(global_params)
+
+                    attack_context = AttackContext(
+                        defender=self.wavelet_defender if at_type == "adaptive" else None,
+                        epoch_num=epoch_num,
+                        debug_store=history['attack_debug']
+                    )
+
+                    if at_type == "adaptive":
+                        try:
+                            benign_probed = self.wavelet_defender.generate_probing_parameters(benign_updates)
+                            attack_context.benign_feature_prototype = self.wavelet_defender.estimate_benign_feature_prototype(
+                                benign_updates,
+                                benign_probed
+                            )
+                            self.logger.info(
+                                f"已估计自适应攻击良性特征原型，维度: {len(attack_context.benign_feature_prototype)}"
+                            )
+                        except Exception as e:
+                            self.logger.warning(f"估计良性特征原型失败，将退化为纯投毒目标: {str(e)}")
+
+                    attack_fn = AttackFactory.create_attack(at_type, self.config, attack_context)
 
                     # 对每个恶意客户端生成特定的恶意更新
                     for i in range(n_attackers):
@@ -2867,6 +2966,9 @@ class FederatedLearning:
                 num_local_epochs=self.config.num_local_epochs,
                 attack_type=at_type,
                 deviation_type=dev_type,
+                adaptive_attack_weight=self.config.adaptive_attack_weight,
+                adaptive_scale_candidates=self.config.adaptive_scale_candidates,
+                attack_debug_enabled=self.config.attack_debug_enabled,
                 defense_enabled=self.config.defense_enabled,
                 seed=self.config.seed + i,  # 不同实验使用不同的种子
                 output_dir=exp_dir,
