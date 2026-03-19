@@ -935,16 +935,20 @@ class WaveletDefense:
             return
 
         df = pd.DataFrame(self.detection_stats)
+        epochs = df['epoch'].to_numpy()
+        detected = df['detected_malicious'].to_numpy()
+        benign_cluster_size = df['benign_cluster_size'].to_numpy()
+        total_clients = df['total_clients'].to_numpy()
 
         plt.figure(figsize=(15, 10))
 
         # 检测统计
         plt.subplot(2, 2, 1)
-        plt.plot(df['epoch'], df['detected_malicious'], marker='o', label='检测为恶意')
-        plt.plot(df['epoch'], df['benign_cluster_size'], marker='s', label='良性簇大小')
+        plt.plot(epochs, detected, marker='o', label='检测为恶意')
+        plt.plot(epochs, benign_cluster_size, marker='s', label='良性簇大小')
         if 'noise_points' in df.columns:
-            plt.plot(df['epoch'], df['noise_points'], marker='^', label='噪声点')
-        plt.plot(df['epoch'], df['total_clients'], '--', label='总客户端数')
+            plt.plot(epochs, df['noise_points'].to_numpy(), marker='^', label='噪声点')
+        plt.plot(epochs, total_clients, '--', label='总客户端数')
         plt.xlabel('训练轮次')
         plt.ylabel('客户端数量')
         plt.title('检测统计')
@@ -976,9 +980,9 @@ class WaveletDefense:
 
             # 精确率、召回率和F1分数
             plt.subplot(2, 2, 2)
-            plt.plot(df['epoch'], precision, marker='o', label='精确率')
-            plt.plot(df['epoch'], recall, marker='s', label='召回率')
-            plt.plot(df['epoch'], f1_score, marker='^', label='F1分数')
+            plt.plot(epochs, precision, marker='o', label='精确率')
+            plt.plot(epochs, recall, marker='s', label='召回率')
+            plt.plot(epochs, f1_score, marker='^', label='F1分数')
             plt.xlabel('训练轮次')
             plt.ylabel('值')
             plt.title('检测性能指标')
@@ -988,11 +992,12 @@ class WaveletDefense:
         # 聚类质量
         if self.clustering_quality:
             quality_df = pd.DataFrame(self.clustering_quality)
+            quality_epochs = quality_df['epoch'].to_numpy()
 
             plt.subplot(2, 2, 3)
-            plt.plot(quality_df['epoch'], quality_df['n_clusters'], marker='o', label='聚类数量')
+            plt.plot(quality_epochs, quality_df['n_clusters'].to_numpy(), marker='o', label='聚类数量')
             if 'noise_ratio' in quality_df.columns:
-                plt.plot(quality_df['epoch'], quality_df['noise_ratio'], marker='s', label='噪声比例')
+                plt.plot(quality_epochs, quality_df['noise_ratio'].to_numpy(), marker='s', label='噪声比例')
             plt.xlabel('训练轮次')
             plt.ylabel('值')
             plt.title('聚类特性')
@@ -1002,10 +1007,12 @@ class WaveletDefense:
             plt.subplot(2, 2, 4)
             valid_silhouette = quality_df[quality_df['silhouette'] > -1]
             if not valid_silhouette.empty:
-                plt.plot(valid_silhouette['epoch'], valid_silhouette['silhouette'], marker='o', label='轮廓系数')
+                plt.plot(valid_silhouette['epoch'].to_numpy(), valid_silhouette['silhouette'].to_numpy(),
+                         marker='o', label='轮廓系数')
             valid_ch = quality_df[quality_df['ch_score'] > -1]
             if not valid_ch.empty:
-                plt.plot(valid_ch['epoch'], valid_ch['ch_score'] / 100, marker='s', label='CH分数 (/100)')
+                plt.plot(valid_ch['epoch'].to_numpy(), (valid_ch['ch_score'] / 100).to_numpy(),
+                         marker='s', label='CH分数 (/100)')
             plt.xlabel('训练轮次')
             plt.ylabel('分数')
             plt.title('聚类质量')

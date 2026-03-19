@@ -598,15 +598,25 @@ class DefenseEvaluator:
             return
 
         df = pd.DataFrame(self.stats)
+        epochs = df['epoch'].to_numpy()
+        detection_rate = df['detection_rate'].to_numpy()
+        false_positive_rate = df['false_positive_rate'].to_numpy()
+        precision = df['precision'].to_numpy()
+        recall = df['recall'].to_numpy()
+        f1_score = df['f1_score'].to_numpy()
+        accuracy = df['accuracy'].to_numpy()
+        detected_malicious = df['detected_malicious'].to_numpy()
+        missed_malicious = df['missed_malicious'].to_numpy()
+        total_selected = df['total_selected'].to_numpy()
 
         plt.figure(figsize=(15, 12))
 
         # 检测率、误报率、精确度和召回率
         plt.subplot(2, 2, 1)
-        plt.plot(df['epoch'], df['detection_rate'], 'g-', label='检测率')
-        plt.plot(df['epoch'], df['false_positive_rate'], 'r-', label='误报率')
-        plt.plot(df['epoch'], df['precision'], 'b--', label='精确度')
-        plt.plot(df['epoch'], df['recall'], 'm--', label='召回率')
+        plt.plot(epochs, detection_rate, 'g-', label='检测率')
+        plt.plot(epochs, false_positive_rate, 'r-', label='误报率')
+        plt.plot(epochs, precision, 'b--', label='精确度')
+        plt.plot(epochs, recall, 'm--', label='召回率')
         plt.xlabel('轮次')
         plt.ylabel('比率')
         plt.title('检测性能')
@@ -615,8 +625,8 @@ class DefenseEvaluator:
 
         # F1分数和准确率
         plt.subplot(2, 2, 2)
-        plt.plot(df['epoch'], df['f1_score'], 'g-', label='F1分数')
-        plt.plot(df['epoch'], df['accuracy'], 'b-', label='准确率')
+        plt.plot(epochs, f1_score, 'g-', label='F1分数')
+        plt.plot(epochs, accuracy, 'b-', label='准确率')
         plt.xlabel('轮次')
         plt.ylabel('分数')
         plt.title('综合性能指标')
@@ -625,12 +635,12 @@ class DefenseEvaluator:
 
         # 检测到和未检测到的恶意客户端数量
         plt.subplot(2, 2, 3)
-        plt.stackplot(df['epoch'],
-                      df['detected_malicious'],
-                      df['missed_malicious'],
+        plt.stackplot(epochs,
+                      detected_malicious,
+                      missed_malicious,
                       labels=['检测到的恶意客户端', '未检测到的恶意客户端'],
                       colors=['g', 'r'])
-        plt.plot(df['epoch'], [self.n_attackers] * len(df), 'k--', label='恶意客户端总数')
+        plt.plot(epochs, [self.n_attackers] * len(df), 'k--', label='恶意客户端总数')
         plt.xlabel('轮次')
         plt.ylabel('客户端数量')
         plt.title('恶意客户端检测情况')
@@ -639,10 +649,10 @@ class DefenseEvaluator:
 
         # 选中的客户端数量
         plt.subplot(2, 2, 4)
-        plt.plot(df['epoch'], df['total_selected'], 'b-', label='选中的客户端总数')
-        plt.plot(df['epoch'], df['total_selected'] - df['missed_malicious'], 'g-', label='良性客户端数量')
-        plt.plot(df['epoch'], [self.n_clients] * len(df), 'k--', label='客户端总数')
-        plt.plot(df['epoch'], [self.n_clients - self.n_attackers] * len(df), 'k:', label='良性客户端总数')
+        plt.plot(epochs, total_selected, 'b-', label='选中的客户端总数')
+        plt.plot(epochs, total_selected - missed_malicious, 'g-', label='良性客户端数量')
+        plt.plot(epochs, [self.n_clients] * len(df), 'k--', label='客户端总数')
+        plt.plot(epochs, [self.n_clients - self.n_attackers] * len(df), 'k:', label='良性客户端总数')
         plt.xlabel('轮次')
         plt.ylabel('客户端数量')
         plt.title('客户端选择情况')
