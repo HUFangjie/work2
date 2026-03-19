@@ -985,6 +985,33 @@ class WaveletDefense:
             plt.legend()
             plt.grid(True, linestyle='--', alpha=0.7)
 
+        # 聚类质量
+        if self.clustering_quality:
+            quality_df = pd.DataFrame(self.clustering_quality)
+
+            plt.subplot(2, 2, 3)
+            plt.plot(quality_df['epoch'], quality_df['n_clusters'], marker='o', label='聚类数量')
+            if 'noise_ratio' in quality_df.columns:
+                plt.plot(quality_df['epoch'], quality_df['noise_ratio'], marker='s', label='噪声比例')
+            plt.xlabel('训练轮次')
+            plt.ylabel('值')
+            plt.title('聚类特性')
+            plt.legend()
+            plt.grid(True, linestyle='--', alpha=0.7)
+
+            plt.subplot(2, 2, 4)
+            valid_silhouette = quality_df[quality_df['silhouette'] > -1]
+            if not valid_silhouette.empty:
+                plt.plot(valid_silhouette['epoch'], valid_silhouette['silhouette'], marker='o', label='轮廓系数')
+            valid_ch = quality_df[quality_df['ch_score'] > -1]
+            if not valid_ch.empty:
+                plt.plot(valid_ch['epoch'], valid_ch['ch_score'] / 100, marker='s', label='CH分数 (/100)')
+            plt.xlabel('训练轮次')
+            plt.ylabel('分数')
+            plt.title('聚类质量')
+            plt.legend()
+            plt.grid(True, linestyle='--', alpha=0.7)
+
         plt.tight_layout()
         plt.savefig('detection_performance.png', dpi=300, bbox_inches='tight')
         plt.show()
@@ -1756,29 +1783,3 @@ class WaveletDefense:
                 n_clients = len(original_updates)
                 n_select = max(1, int(n_clients * 0.1))
                 return np.random.choice(n_clients, n_select, replace=False).tolist()
-
-        # 聚类质量
-        if self.clustering_quality:
-            quality_df = pd.DataFrame(self.clustering_quality)
-            plt.subplot(2, 2, 3)
-            plt.plot(quality_df['epoch'], quality_df['n_clusters'], marker='o', label='聚类数量')
-            if 'noise_ratio' in quality_df.columns:
-                plt.plot(quality_df['epoch'], quality_df['noise_ratio'], marker='s', label='噪声比例')
-            plt.xlabel('训练轮次')
-            plt.ylabel('值')
-            plt.title('聚类特性')
-            plt.legend()
-            plt.grid(True, linestyle='--', alpha=0.7)
-
-            plt.subplot(2, 2, 4)
-            valid_silhouette = quality_df[quality_df['silhouette'] > -1]
-            if not valid_silhouette.empty:
-                plt.plot(valid_silhouette['epoch'], valid_silhouette['silhouette'], marker='o', label='轮廓系数')
-            valid_ch = quality_df[quality_df['ch_score'] > -1]
-            if not valid_ch.empty:
-                plt.plot(valid_ch['epoch'], valid_ch['ch_score'] / 100, marker='s', label='CH分数 (/100)')  # 缩放以适应图表
-            plt.xlabel('训练轮次')
-            plt.ylabel('分数')
-            plt.title('聚类质量')
-            plt.legend()
-            plt.grid(True, linestyle='--', alpha=0.7)
