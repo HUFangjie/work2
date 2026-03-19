@@ -29,7 +29,7 @@ class WaveletDefense:
 
     def __init__(self, model, num_clients, input_shape=(1, 28, 28), wavelet='db4',
                  epsilon=0.1, eps=0.01, min_samples=2, num_features=None, device=None,
-                 clustering_method='kmeans'):
+                 clustering_method='kmeans', logger=None, verbose=False):
         """
         初始化小波防御机制
 
@@ -56,6 +56,8 @@ class WaveletDefense:
         self.device = device if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.scaler = StandardScaler()
         self.clustering_method = clustering_method
+        self.logger = logger
+        self.verbose = verbose
 
         # 性能指标
         self.detection_stats = []
@@ -73,6 +75,16 @@ class WaveletDefense:
 
         self.client_overhead = {}
         self.current_epoch = 0  # 添加当前轮次记录
+
+    def _log(self, message, level="info", verbose_only=False):
+        if verbose_only and not self.verbose:
+            return
+
+        if self.logger is not None:
+            log_fn = getattr(self.logger, level, self.logger.info)
+            log_fn(message)
+        else:
+            print(message)
 
     def extract_feature_differences(self, original_updates, probed_updates):
         """
@@ -176,11 +188,11 @@ class WaveletDefense:
             kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
             labels = kmeans.fit_predict(feature_vectors)
 
-            print(f"KMeans聚类完成, 聚类数={n_clusters}")
+            self._log(f"KMeans聚类完成, 聚类数={n_clusters}", verbose_only=True)
             return labels
 
         except Exception as e:
-            print(f"KMeans聚类出错: {str(e)}")
+            self._log(f"KMeans聚类出错: {str(e)}", level="warning")
             # 失败时返回所有点为一类
             return np.zeros(len(feature_vectors), dtype=int)
 
@@ -206,11 +218,11 @@ class WaveletDefense:
                                             random_state=42)
             labels = clustering.fit_predict(feature_vectors)
 
-            print(f"谱聚类完成, 聚类数={n_clusters}")
+            self._log(f"谱聚类完成, 聚类数={n_clusters}", verbose_only=True)
             return labels
 
         except Exception as e:
-            print(f"谱聚类出错: {str(e)}")
+            self._log(f"谱聚类出错: {str(e)}", level="warning")
             # 失败时返回所有点为一类
             return np.zeros(len(feature_vectors), dtype=int)
 
@@ -234,11 +246,11 @@ class WaveletDefense:
             clustering = AgglomerativeClustering(n_clusters=n_clusters)
             labels = clustering.fit_predict(feature_vectors)
 
-            print(f"层次聚类完成, 聚类数={n_clusters}")
+            self._log(f"层次聚类完成, 聚类数={n_clusters}", verbose_only=True)
             return labels
 
         except Exception as e:
-            print(f"层次聚类出错: {str(e)}")
+            self._log(f"层次聚类出错: {str(e)}", level="warning")
             # 失败时返回所有点为一类
             return np.zeros(len(feature_vectors), dtype=int)
 
@@ -265,11 +277,11 @@ class WaveletDefense:
             labels = np.zeros(len(feature_vectors_2d), dtype=int)
             labels[y_values > threshold] = 1
 
-            print(f"基于阈值的聚类完成, 阈值={threshold:.4f}, 类别1大小={np.sum(labels == 1)}")
+            self._log(f"基于阈值的聚类完成, 阈值={threshold:.4f}, 类别1大小={np.sum(labels == 1)}", verbose_only=True)
             return labels
 
         except Exception as e:
-            print(f"基于阈值的聚类出错: {str(e)}")
+            self._log(f"基于阈值的聚类出错: {str(e)}", level="warning")
             # 失败时返回所有点为一类
             return np.zeros(len(feature_vectors_2d), dtype=int)
 
@@ -335,11 +347,11 @@ class WaveletDefense:
                 if labels[i] == -1:  # 如果尚未分配
                     labels[i] = labels[nneigh[i]]
 
-            print(f"密度峰值聚类完成, 聚类数={n_clusters}")
+            self._log(f"密度峰值聚类完成, 聚类数={n_clusters}", verbose_only=True)
             return labels
 
         except Exception as e:
-            print(f"密度峰值聚类出错: {str(e)}")
+            self._log(f"密度峰值聚类出错: {str(e)}", level="warning")
             # 失败时返回所有点为一类
             return np.zeros(len(feature_vectors), dtype=int)
 
@@ -413,11 +425,11 @@ class WaveletDefense:
             threshold = len(normalized_results) / 2  # 多数票
             final_labels[ensemble_result > threshold] = 1
 
-            print(f"集成聚类完成, 使用了{len(normalized_results)}种方法, 类别1大小={np.sum(final_labels == 1)}")
+            self._log(f"集成聚类完成, 使用了{len(normalized_results)}种方法, 类别1大小={np.sum(final_labels == 1)}", verbose_only=True)
             return final_labels
 
         except Exception as e:
-            print(f"集成聚类出错: {str(e)}")
+            self._log(f"集成聚类出错: {str(e)}", level="warning")
             # 失败时使用基于阈值的方法
             return self._threshold_based_clustering(feature_vectors_2d)
 
@@ -1491,7 +1503,7 @@ class WaveletDefense:
                 probing_params.append(probed_update)
 
             except Exception as e:
-                print(f"生成诱导参数时出错: {str(e)}")
+                self._log(f"生成诱导参数时出错，回退到随机噪声: {str(e)}", level="warning")
                 # 如果生成失败，使用原始更新加上随机噪声
                 random_noise = torch.randn_like(update) * self.epsilon
                 probed_update = update + random_noise
@@ -1523,7 +1535,7 @@ class WaveletDefense:
                 try:
                     normalized_feature_vectors = self.scaler.fit_transform(feature_vectors)
                 except Exception as e:
-                    print(f"特征标准化失败: {str(e)}")
+                    self._log(f"特征标准化失败，回退到min-max归一化: {str(e)}", level="warning")
                     # 如果标准化失败，使用简单的min-max归一化
                     feature_vectors = np.array(feature_vectors)
                     feature_max = np.max(feature_vectors, axis=0)
@@ -1538,7 +1550,7 @@ class WaveletDefense:
                 # 将特征值限制在合理范围内
                 normalized_feature_vectors = np.clip(normalized_feature_vectors, -5, 5)
             else:
-                print("没有有效的特征向量，返回空列表")
+                self._log("没有有效的特征向量，返回空列表", level="warning")
                 return []
 
             # 先使用PCA降维，然后再进行聚类（关键修改部分）
@@ -1550,9 +1562,9 @@ class WaveletDefense:
             try:
                 feature_vectors_2d = pca.fit_transform(normalized_feature_vectors)
                 explained_variance = np.sum(pca.explained_variance_ratio_)
-                print(f"PCA解释方差比例: {explained_variance:.2%}")
+                self._log(f"轮次 {epoch_num} PCA解释方差比例: {explained_variance:.2%}", verbose_only=True)
             except Exception as e:
-                print(f"PCA降维失败: {str(e)}")
+                self._log(f"PCA降维失败，回退到前两维特征: {str(e)}", level="warning")
                 # 如果PCA失败，使用原始特征的前两个维度
                 if normalized_feature_vectors.shape[1] >= 2:
                     feature_vectors_2d = normalized_feature_vectors[:, :2]
@@ -1584,13 +1596,12 @@ class WaveletDefense:
 
                 self.epoch_numbers.append(epoch_num)
 
-                # 打印真实客户端代表值统计
-                print("\n=== 真实客户端代表值统计 ===")
-                print(f"轮次 {epoch_num}:")
-                print(f"真实良性客户端代表值均值: {self.benign_rep_values_history[-1]:.4f}")
-                print(f"真实恶意客户端代表值均值: {self.malicious_rep_values_history[-1]:.4f}")
-                print(
-                    f"真实代表值差异: {self.malicious_rep_values_history[-1] - self.benign_rep_values_history[-1]:.4f}")
+                self._log(
+                    f"轮次 {epoch_num} 特征代表值统计: 良性均值={self.benign_rep_values_history[-1]:.4f}, "
+                    f"恶意均值={self.malicious_rep_values_history[-1]:.4f}, "
+                    f"差异={self.malicious_rep_values_history[-1] - self.benign_rep_values_history[-1]:.4f}",
+                    verbose_only=True
+                )
 
 
             # 使用降维后的特征向量进行聚类（关键修改部分）
@@ -1601,7 +1612,7 @@ class WaveletDefense:
             else:
                 method = self.clustering_method
 
-            print(f"选择的聚类方法: {method}")
+            self._log(f"轮次 {epoch_num} 选择的聚类方法: {method}", verbose_only=True)
 
             # 根据选择的方法执行聚类，使用降维后的特征向量（关键修改部分）
             if method == 'dbscan':
@@ -1632,7 +1643,7 @@ class WaveletDefense:
             unique_labels = np.unique(labels)
             n_clusters = len(unique_labels) - (1 if -1 in unique_labels else 0)
 
-            print(f"聚类数量: {n_clusters}")
+            self._log(f"轮次 {epoch_num} 聚类数量: {n_clusters}", verbose_only=True)
 
             if n_clusters > 1 and n_clusters < len(labels):
                 try:
@@ -1647,10 +1658,9 @@ class WaveletDefense:
                     # Calinski-Harabasz分数
                     ch_score = calinski_harabasz_score(feature_vectors_2d, labels)  # 使用降维后的特征（关键修改部分）
 
-                    print(f"轮廓系数: {silhouette_avg:.3f}")
-                    print(f"Calinski-Harabasz分数: {ch_score:.1f}")
+                    self._log(f"轮次 {epoch_num} 聚类质量: silhouette={silhouette_avg:.3f}, CH={ch_score:.1f}", verbose_only=True)
                 except Exception as e:
-                    print(f"计算聚类质量指标出错: {str(e)}")
+                    self._log(f"计算聚类质量指标出错: {str(e)}", level="warning")
 
             # 记录聚类质量指标
             self.clustering_quality.append({
@@ -1664,7 +1674,7 @@ class WaveletDefense:
 
             # 如果所有点都是单独的簇或全是噪声点，使用基于差分向量模长的方法
             if n_clusters <= 1 or n_clusters >= len(labels) * 0.8:
-                print("聚类失败：簇数量不合理，使用基于差分向量模长的方法")
+                self._log("聚类失败：簇数量不合理，使用基于差分向量模长的方法", level="warning")
                 return self._norm_based_detection(feature_vectors)
 
             # 计算每个簇的代表值
@@ -1686,14 +1696,11 @@ class WaveletDefense:
 
             # 如果没有有效的簇，使用距离分析
             if not cluster_representatives:
-                print("未找到有效的簇，使用距离分析方法")
+                self._log("未找到有效的簇，使用距离分析方法", level="warning")
                 return self._statistical_outlier_detection(feature_vectors_2d)  # 使用降维后的特征（关键修改部分）
-
-            # 打印每个簇的代表值
-            print("\n=== 簇代表值 ===")
             for label, value in sorted(cluster_representatives.items(), key=lambda x: x[1], reverse=True):
                 cluster_size = np.sum(labels == label)
-                print(f"簇 {label}: 大小 = {cluster_size}, 代表值 = {value:.4f}")
+                self._log(f"轮次 {epoch_num} 簇 {label}: 大小={cluster_size}, 代表值={value:.4f}", verbose_only=True)
 
             # 分析特征重要性
             if len(unique_labels) > 1:
@@ -1701,14 +1708,17 @@ class WaveletDefense:
 
             # 选择具有最高代表值的簇作为良性客户端群体
             benign_cluster = min(cluster_representatives, key=cluster_representatives.get)
-            print(f"\n选择的良性簇: {benign_cluster}, 代表值: {cluster_representatives[benign_cluster]:.4f}")
+            self._log(
+                f"轮次 {epoch_num} 选择良性簇 {benign_cluster}，代表值={cluster_representatives[benign_cluster]:.4f}",
+                verbose_only=True
+            )
 
             # 将不在良性簇中的客户端标记为恶意
             malicious_indices = [i for i in range(len(labels)) if labels[i] != benign_cluster]
 
             # 如果所有客户端都被标记为恶意，选择其中一部分作为良性
             if len(malicious_indices) == len(labels):
-                print("警告: 所有客户端都被标记为恶意，基于差分向量模长选择部分作为良性")
+                self._log("所有客户端都被标记为恶意，回退到基于差分向量模长的选择", level="warning")
                 return self._norm_based_detection(feature_vectors)
 
             # 保存检测统计信息
@@ -1724,20 +1734,20 @@ class WaveletDefense:
             # 缓存本轮检测的恶意客户端索引
             self.malicious_indices_cache[epoch_num] = malicious_indices
 
-            # 打印详细的检测信息
-            print("\n=== 检测结果 ===")
-            print(f"总客户端数: {len(labels)}")
-            print(f"被检测为恶意的客户端数: {len(malicious_indices)}")
-            print(f"良性簇大小: {np.sum(labels == benign_cluster)}")
-            print(f"噪声点数量: {np.sum(labels == -1) if -1 in labels else 0}")
+            self._log(
+                f"轮次 {epoch_num} 检测完成: 恶意客户端={len(malicious_indices)}, "
+                f"良性簇大小={np.sum(labels == benign_cluster)}, "
+                f"噪声点={np.sum(labels == -1) if -1 in labels else 0}"
+            )
 
             self.execution_time['detection'] = time.time() - start_time
             return malicious_indices
 
         except Exception as e:
-            print(f"检测恶意客户端时发生错误: {str(e)}")
+            self._log(f"检测恶意客户端时发生错误: {str(e)}", level="error")
             # 如果检测过程失败，使用基于差分向量模长的方法
-            traceback.print_exc()  # 打印详细的错误堆栈
+            if self.verbose:
+                traceback.print_exc()  # 打印详细的错误堆栈
             # 如果检测过程失败，使用基于差分向量模长的方法
             if 'feature_vectors' in locals() and len(feature_vectors) > 0:
                 return self._norm_based_detection(np.array(feature_vectors))

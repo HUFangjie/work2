@@ -67,6 +67,10 @@ class FLConfig:
     adaptive_attack_weight: float = 0.5
     adaptive_scale_candidates: Tuple[float, ...] = (0.5, 1.0, 2.0, 5.0, 10.0)
     attack_debug_enabled: bool = True
+    verbose_logging: bool = False
+    data_debug_logging: bool = False
+    model_debug_logging: bool = False
+    save_all_snapshots: bool = False
 
     # 防御配置
     defense_enabled: bool = True
@@ -128,7 +132,7 @@ class LoggerFactory:
     """日志工厂类，用于创建和管理日志记录器"""
 
     @staticmethod
-    def setup_logger(name: str, log_dir: str = 'logs') -> logging.Logger:
+    def setup_logger(name: str, log_dir: str = 'logs', level: int = logging.INFO) -> logging.Logger:
         """设置日志记录器
 
         Args:
@@ -148,7 +152,7 @@ class LoggerFactory:
 
         # 避免重复配置
         if not logger.handlers:
-            logger.setLevel(logging.INFO)
+            logger.setLevel(level)
 
             # 文件处理器
             file_handler = logging.FileHandler(log_file)
@@ -558,17 +562,12 @@ class DefenseEvaluator:
 
     def print_round_stats(self, round_stats: Dict[str, float]) -> None:
         """打印单轮统计信息"""
-        print("\n=== 防御性能 ===")
-        print(f"选中的客户端总数: {round_stats['total_selected']}")
-        print(f"检测到的恶意客户端: {round_stats['detected_malicious']}/{self.n_attackers}")
-        print(f"逃过检测的恶意客户端: {round_stats['missed_malicious']}")
-        print(f"误判的良性客户端: {round_stats['false_positives']}")
-        print(f"检测率: {round_stats['detection_rate']:.2%}")
-        print(f"误报率: {round_stats['false_positive_rate']:.2%}")
-        print(f"精确度: {round_stats['precision']:.2%}")
-        print(f"召回率: {round_stats['recall']:.2%}")
-        print(f"F1分数: {round_stats['f1_score']:.2%}")
-        print(f"准确率: {round_stats['accuracy']:.2%}")
+        print(
+            f"防御统计[epoch={round_stats['epoch']}]: detected={round_stats['detected_malicious']}/{self.n_attackers}, "
+            f"missed={round_stats['missed_malicious']}, fp={round_stats['false_positives']}, "
+            f"recall={round_stats['recall']:.2%}, precision={round_stats['precision']:.2%}, "
+            f"f1={round_stats['f1_score']:.2%}, acc={round_stats['accuracy']:.2%}"
+        )
 
     def get_summary(self) -> Optional[Dict[str, float]]:
         """获取整体统计信息"""
@@ -1184,7 +1183,7 @@ class AttackFactory:
 
                 if attack_context and attack_context.defender and attack_context.benign_feature_prototype is not None:
                     defender = attack_context.defender
-                    with torch.no_grad():
+                    with torch.enable_grad():
                         candidate_updates = torch.stack([candidate.detach()])
                         candidate_probed = defender.generate_probing_parameters(candidate_updates)
                         candidate_features = defender.extract_feature_differences(
@@ -1413,7 +1412,12 @@ class DataManager:
         torch.manual_seed(config.seed)
         np.random.seed(config.seed)
 
-        print(f"加载 {dataset} 数据集")
+        def emit(message: str, verbose_only: bool = False) -> None:
+            if verbose_only and not config.data_debug_logging:
+                return
+            print(message)
+
+        emit(f"加载 {dataset} 数据集")
 
         # 根据数据集类型选择不同的转换和加载方法
         if dataset == 'mnist':
@@ -1498,8 +1502,7 @@ class DataManager:
             raw_train_dataset = CIFAR10(root=data_dir, train=True, download=True, transform=None)
             raw_test_dataset = CIFAR10(root=data_dir, train=False, download=True, transform=None)
 
-        print(f"验证集大小: {val_len}")
-        print(f"测试集大小: {te_len}")
+        emit(f"验证/测试预留大小: val={val_len}, test={te_len}", verbose_only=True)
 
         # 获取原始数据和标签
         if dataset == 'mnist' or dataset == 'fashion-mnist':
@@ -1541,9 +1544,13 @@ class DataManager:
         for label in range(num_classes):
             label_counts[label] = (all_labels == label).sum().item()
 
-        print("全部数据中各类别样本数:")
-        for label, count in label_counts.items():
-            print(f"  类别 {label}: {count}样本")
+        emit(
+            f"原始数据集总样本数: {len(all_labels)}，类别数: {num_classes}，"
+            f"各类最小/最大样本数: {min(label_counts.values())}/{max(label_counts.values())}"
+        )
+        if config.data_debug_logging:
+            for label, count in label_counts.items():
+                emit(f"  类别 {label}: {count}样本")
 
         # 分割训练、验证和测试集
         # 先随机打乱索引
@@ -1564,13 +1571,11 @@ class DataManager:
         test_data = all_images[test_indices]
         test_labels = all_labels[test_indices]
 
-        print(f"训练集大小: {len(train_indices)}")
-        print(f"验证集大小: {len(val_indices)}")
-        print(f"测试集大小: {len(test_indices)}")
+        emit(f"数据切分完成: train={len(train_indices)}, val={len(val_indices)}, test={len(test_indices)}")
 
         # 数据分区
         if is_iid:
-            print("使用IID数据分布")
+            emit("使用IID数据分布")
             # IID分区: 随机均匀分配
             indices = torch.randperm(len(train_data))
 
@@ -1592,9 +1597,9 @@ class DataManager:
                 user_train_data.append(user_data)
                 user_train_labels.append(user_labels)
 
-                print(f"客户端 {i}: 分配了 {len(user_data)} 个样本")
+                emit(f"客户端 {i}: 分配了 {len(user_data)} 个样本", verbose_only=True)
         else:
-            print(f"使用non-IID数据分布 (Dirichlet alpha={dirichlet_alpha})")
+            emit(f"使用non-IID数据分布 (Dirichlet alpha={dirichlet_alpha})")
 
             # 使用专用函数创建non-IID分区
             client_partitions = DataManager.create_non_iid_partition(
@@ -1614,9 +1619,9 @@ class DataManager:
 
                 # 打印每个客户端的样本分布
                 classes, counts = torch.unique(user_labels, return_counts=True)
-                print(f"客户端 {i}: 总样本数 = {len(user_labels)}")
+                emit(f"客户端 {i}: 总样本数 = {len(user_labels)}", verbose_only=True)
                 for c, count in zip(classes.tolist(), counts.tolist()):
-                    print(f"  类别 {c}: {count} 样本 ({count / len(user_labels) * 100:.1f}%)")
+                    emit(f"  类别 {c}: {count} 样本 ({count / len(user_labels) * 100:.1f}%)", verbose_only=True)
 
         # 应用标准化处理
         if dataset == 'mnist':
@@ -1650,13 +1655,18 @@ class DataManager:
             val_label_counts[label] = (val_labels == label).sum().item()
             test_label_counts[label] = (test_labels == label).sum().item()
 
-        print("\n验证集类别分布:")
-        for label, count in val_label_counts.items():
-            print(f"  类别 {label}: {count}样本 ({count / len(val_labels) * 100:.1f}%)")
+        emit(
+            f"验证集标签范围: min={min(val_label_counts.values())}, max={max(val_label_counts.values())}; "
+            f"测试集标签范围: min={min(test_label_counts.values())}, max={max(test_label_counts.values())}"
+        )
+        if config.data_debug_logging:
+            emit("\n验证集类别分布:")
+            for label, count in val_label_counts.items():
+                emit(f"  类别 {label}: {count}样本 ({count / len(val_labels) * 100:.1f}%)")
 
-        print("\n测试集类别分布:")
-        for label, count in test_label_counts.items():
-            print(f"  类别 {label}: {count}样本 ({count / len(test_labels) * 100:.1f}%)")
+            emit("\n测试集类别分布:")
+            for label, count in test_label_counts.items():
+                emit(f"  类别 {label}: {count}样本 ({count / len(test_labels) * 100:.1f}%)")
 
         # 确保数据类型正确
         for i in range(len(user_train_data)):
@@ -1670,15 +1680,19 @@ class DataManager:
         test_labels = test_labels.long()
 
         # 输出每个集合的形状和类型
-        print(f"\n用户训练数据: {len(user_train_data)} 个客户端")
-        print(f"用户0数据形状: {user_train_data[0].shape}, 类型: {user_train_data[0].dtype}")
-        print(f"用户0标签形状: {user_train_labels[0].shape}, 类型: {user_train_labels[0].dtype}")
-
-        print(f"验证数据形状: {val_data.shape}, 类型: {val_data.dtype}")
-        print(f"验证标签形状: {val_labels.shape}, 类型: {val_labels.dtype}")
-
-        print(f"测试数据形状: {test_data.shape}, 类型: {test_data.dtype}")
-        print(f"测试标签形状: {test_labels.shape}, 类型: {test_labels.dtype}")
+        client_sizes = [len(data) for data in user_train_data]
+        emit(
+            f"联邦数据准备完成: clients={len(user_train_data)}, "
+            f"client_samples[min/avg/max]={min(client_sizes)}/{np.mean(client_sizes):.1f}/{max(client_sizes)}, "
+            f"val_shape={tuple(val_data.shape)}, test_shape={tuple(test_data.shape)}"
+        )
+        if config.data_debug_logging:
+            emit(f"用户0数据形状: {user_train_data[0].shape}, 类型: {user_train_data[0].dtype}")
+            emit(f"用户0标签形状: {user_train_labels[0].shape}, 类型: {user_train_labels[0].dtype}")
+            emit(f"验证数据形状: {val_data.shape}, 类型: {val_data.dtype}")
+            emit(f"验证标签形状: {val_labels.shape}, 类型: {val_labels.dtype}")
+            emit(f"测试数据形状: {test_data.shape}, 类型: {test_data.dtype}")
+            emit(f"测试标签形状: {test_labels.shape}, 类型: {test_labels.dtype}")
 
         return user_train_data, user_train_labels, val_data, val_labels, test_data, test_labels
 # =========================================================
@@ -1962,14 +1976,33 @@ class FederatedLearning:
         """
         self.config = config
         self.device = config.device
+        self.verbose_logging = config.verbose_logging
+        self.model_debug_logging = config.model_debug_logging
+        self.save_all_snapshots = config.save_all_snapshots
         self.logger = LoggerFactory.setup_logger('federated_learning',
                                                  os.path.join(config.output_dir, 'logs'))
 
         # 记录配置信息
-        self.logger.info(f"初始化联邦学习系统 - 配置: {vars(config)}")
+        config_summary = {
+            'dataset': config.dataset,
+            'num_clients': config.num_clients,
+            'num_attackers': config.num_attackers,
+            'num_epochs': config.num_epochs,
+            'num_local_epochs': config.num_local_epochs,
+            'attack_type': config.attack_type,
+            'deviation_type': config.deviation_type,
+            'defense_enabled': config.defense_enabled,
+            'output_dir': config.output_dir,
+            'verbose_logging': config.verbose_logging
+        }
+        self.logger.info(f"初始化联邦学习系统 - 配置摘要: {config_summary}")
         self.logger.info(f"使用设备: {self.device}")
         # 初始化轮次计时统计
         self.round_overhead = {}  # 或使用 defaultdict: from collections import defaultdict; self.round_overhead = defaultdict(dict)
+
+    def _log_verbose(self, message: str) -> None:
+        if self.verbose_logging:
+            self.logger.info(message)
 
     def _fedavg_aggregate(self, global_model: nn.Module, client_models: List[nn.Module],
                           weights: List[float]) -> None:
@@ -2052,12 +2085,12 @@ class FederatedLearning:
                     global_model.load_state_dict(backup_state_dict)
                     return
 
-            self.logger.info("联邦平均聚合成功完成")
+            self._log_verbose("联邦平均聚合成功完成")
 
             # 打印一些聚合后参数的统计信息
             for key, param in list(global_model.state_dict().items())[:3]:  # 只打印前几个参数的统计信息
                 if param.numel() > 0:  # 确保参数不是空的
-                    self.logger.info(
+                    self._log_verbose(
                         f"参数 {key}: 均值={param.float().mean().item():.6f}, 标准差={param.float().std().item():.6f}, " +
                         f"最小值={param.float().min().item():.6f}, 最大值={param.float().max().item():.6f}")
 
@@ -2115,7 +2148,7 @@ class FederatedLearning:
                             last_layer_params[name] = param
 
             # 打印识别到的最后一层参数
-            if last_layer_params:
+            if last_layer_params and self.model_debug_logging:
                 self.logger.info(f"轮次 {epoch_num} {stage}时最后一层参数:")
                 for name, param in last_layer_params.items():
                     # 如果参数太大，只打印统计信息和前几个值
@@ -2132,7 +2165,7 @@ class FederatedLearning:
                     else:
                         # 如果参数较小，则打印全部值
                         self.logger.info(f"  {name}: {param.data.cpu().numpy().tolist()}")
-            else:
+            elif self.model_debug_logging:
                 self.logger.warning(f"轮次 {epoch_num} {stage}时无法识别最后一层参数")
 
 
@@ -2159,7 +2192,7 @@ class FederatedLearning:
         # 检查输入数据
         nusers = len(user_tr_data_tensors)
         self.logger.info(f"客户端总数: {nusers}")
-        self.logger.info(f"每个客户端训练数据大小: {user_tr_data_tensors[0].size()}")
+        self._log_verbose(f"每个客户端训练数据大小: {user_tr_data_tensors[0].size()}")
 
         if n_attackers > nusers:
             self.logger.warning(f"攻击者数量 ({n_attackers}) 超过了客户端总数 ({nusers})，设置为 {nusers - 1}")
@@ -2169,7 +2202,7 @@ class FederatedLearning:
         user_tr_len = user_tr_data_tensors[0].size(0)
         nbatches = (user_tr_len + batch_size - 1) // batch_size
         self.logger.info(f"每个客户端训练样本数: {user_tr_len}, 批次数: {nbatches}")
-        self.logger.info(f"客户端本地训练轮数: {num_local_epochs}")
+        self._log_verbose(f"客户端本地训练轮数: {num_local_epochs}")
 
         # 初始化模型和优化器
         fed_model, optimizer_fed = model_fn(self.config)
@@ -2183,14 +2216,17 @@ class FederatedLearning:
 
         # 初始化小波防御器
         input_shape = tuple(user_tr_data_tensors[0][0].size())
-        self.logger.info(f"输入形状: {input_shape}")
+        self._log_verbose(f"输入形状: {input_shape}")
         input_channels = input_shape[0]  # 获取通道数
 
         # 为不同数据集选择合适的小波防御器
         if self.config.dataset == 'fashion-mnist':
             self.wavelet_defender = self._create_fashion_mnist_defender(fed_model, nusers, input_shape)
         else:
-            self.wavelet_defender = WaveletDefense(fed_model, nusers, input_shape=input_shape, device=device)
+            self.wavelet_defender = WaveletDefense(
+                fed_model, nusers, input_shape=input_shape, device=device,
+                logger=self.logger, verbose=self.verbose_logging
+            )
 
         # 初始化防御评估器
         evaluator = DefenseEvaluator(n_attackers, nusers)
@@ -2218,7 +2254,7 @@ class FederatedLearning:
         max_epochs_without_improvement = 50  # 早停参数
 
         data_weights = [len(data) for data in user_tr_data_tensors]
-        self.logger.info(f"客户端数据量分布: {data_weights}")
+        self._log_verbose(f"客户端数据量分布: {data_weights}")
 
         start_time = time.time()
 
@@ -2226,7 +2262,7 @@ class FederatedLearning:
             """保存模型参数快照"""
             try:
                 torch.save(model.state_dict(), filename)
-                self.logger.info(f"已保存模型快照到 {filename}")
+                self._log_verbose(f"已保存模型快照到 {filename}")
             except Exception as e:
                 self.logger.error(f"保存模型快照失败: {str(e)}")
 
@@ -2244,7 +2280,7 @@ class FederatedLearning:
             max_norm = np.max(param_norms) if param_norms else 0
             min_norm = np.min(param_norms) if param_norms else 0
 
-            self.logger.info(
+            self._log_verbose(
                 f"{stage} 模型参数统计 - 总参数数量: {total_params}, 平均范数: {avg_norm:.6f}, 最大范数: {max_norm:.6f}, 最小范数: {min_norm:.6f}")
 
 
@@ -2269,7 +2305,8 @@ class FederatedLearning:
 
             # 保存当前轮次的模型
             current_model_path = os.path.join(self.config.output_dir, f"model_epoch_{epoch_num}.pth")
-            save_model_snapshot(fed_model, current_model_path)
+            if self.save_all_snapshots:
+                save_model_snapshot(fed_model, current_model_path)
 
             # 为每个客户端创建本地模型副本并训练
             all_client_models = []
@@ -2295,7 +2332,7 @@ class FederatedLearning:
                 is_malicious = i < n_attackers
                 client_type = "恶意" if is_malicious else "良性"
 
-                self.logger.info(f"训练客户端 {i} ({client_type})...")
+                self._log_verbose(f"训练客户端 {i} ({client_type})...")
 
                 # 训练客户端模型
                 if not is_malicious:  # 只训练良性客户端
@@ -2315,10 +2352,10 @@ class FederatedLearning:
 
                     if client_epoch_metrics:
                         final_metrics = client_epoch_metrics[-1]
-                        self.logger.info(
+                        self._log_verbose(
                             f"客户端 {i} 训练完成，平均损失: {client_loss:.4f}, 最终准确率: {final_metrics['accuracy']:.2f}%")
                     else:
-                        self.logger.info(f"客户端 {i} 训练完成，平均损失: {client_loss:.4f}")
+                        self._log_verbose(f"客户端 {i} 训练完成，平均损失: {client_loss:.4f}")
 
 
                 # 保存客户端模型和权重
@@ -2367,7 +2404,7 @@ class FederatedLearning:
                                 benign_updates,
                                 benign_probed
                             )
-                            self.logger.info(
+                            self._log_verbose(
                                 f"已估计自适应攻击良性特征原型，维度: {len(attack_context.benign_feature_prototype)}"
                             )
                         except Exception as e:
@@ -2391,7 +2428,7 @@ class FederatedLearning:
                                 param.data = mal_update[idx:idx + param_size].reshape(param.shape).to(device)
                                 idx += param_size
 
-                            self.logger.info(f"为恶意客户端 {i} 生成了 {at_type} 攻击更新")
+                            self._log_verbose(f"为恶意客户端 {i} 生成了 {at_type} 攻击更新")
 
                         except Exception as e:
                             self.logger.error(f"恶意更新生成失败: {str(e)}")
@@ -2412,7 +2449,7 @@ class FederatedLearning:
 
             # 生成诱导参数
             probed_updates = self.wavelet_defender.generate_probing_parameters(all_client_params_tensor)
-            self.logger.info(f"生成诱导参数完成，形状: {probed_updates.shape}")
+            self._log_verbose(f"生成诱导参数完成，形状: {probed_updates.shape}")
 
             # 检测恶意客户端
             try:
@@ -2424,7 +2461,7 @@ class FederatedLearning:
 
                 # 选择被参与聚合的客户端索引
                 selected_indices = [i for i in range(len(all_client_models)) if i not in malicious_indices]
-                self.logger.info(f"选中的客户端索引: {selected_indices}")
+                self._log_verbose(f"选中的客户端索引: {selected_indices}")
 
                 # 评估防御效果
                 defense_stats = evaluator.evaluate_round(selected_indices, malicious_indices, epoch_num)
@@ -2463,7 +2500,8 @@ class FederatedLearning:
 
                 # 保存聚合后的全局模型
                 aggregated_model_path = os.path.join(self.config.output_dir, f"model_aggregated_epoch_{epoch_num}.pth")
-                save_model_snapshot(fed_model, aggregated_model_path)
+                if self.save_all_snapshots:
+                    save_model_snapshot(fed_model, aggregated_model_path)
             else:
                 self.logger.warning("没有选中任何客户端进行聚合！保持全局模型不变")
 
@@ -2474,7 +2512,7 @@ class FederatedLearning:
             # 更新学习率
             lr_changed = scheduler.step(epoch_num)
             if lr_changed:
-                self.logger.info(f"学习率更新为: {scheduler.get_last_lr()[0]}")
+                self._log_verbose(f"学习率更新为: {scheduler.get_last_lr()[0]}")
 
             # 记录当前学习率
             history['lr'].append(scheduler.get_last_lr()[0])
@@ -2544,7 +2582,7 @@ class FederatedLearning:
             self.logger.info(f"测试集: 损失 = {test_loss:.4f}, 准确率 = {test_acc:.2f}%")
 
             # 添加诊断信息
-            self.logger.info("全局模型评估诊断:")
+            self._log_verbose("全局模型评估诊断:")
             # 随机抽样5个样本输出预测值与真实值比较
             with torch.no_grad():
                 random_indices = torch.randperm(len(val_data_tensor))[:5]
@@ -2555,8 +2593,10 @@ class FederatedLearning:
                 _, sample_preds = torch.max(sample_outputs, 1)
 
                 for i in range(len(random_indices)):
-                    self.logger.info(f"样本 {i}: 预测 = {sample_preds[i].item()}, 真实 = {sample_targets[i].item()}, " +
-                                     f"{'正确' if sample_preds[i] == sample_targets[i] else '错误'}")
+                    self._log_verbose(
+                        f"样本 {i}: 预测 = {sample_preds[i].item()}, 真实 = {sample_targets[i].item()}, "
+                        f"{'正确' if sample_preds[i] == sample_targets[i] else '错误'}"
+                    )
             # 更新历史记录
             history['epoch'].append(epoch_num)
             history['train_loss'].append(train_loss)
@@ -2585,7 +2625,7 @@ class FederatedLearning:
                 epochs_without_improvement = 0
             else:
                 epochs_without_improvement += 1
-                self.logger.info(f"模型性能未提升，已经{epochs_without_improvement}轮未改善")
+                self._log_verbose(f"模型性能未提升，已经{epochs_without_improvement}轮未改善")
 
             # 早停检查
             if epochs_without_improvement >= max_epochs_without_improvement:
@@ -2594,12 +2634,15 @@ class FederatedLearning:
 
             # 计算轮次耗时
             epoch_time = time.time() - epoch_start_time
-            self.logger.info(f"轮次{epoch_num}完成，耗时: {epoch_time:.2f}秒")
+            self.logger.info(
+                f"轮次 {epoch_num} 总结: train_loss={train_loss:.4f}, val_acc={val_acc:.2f}%, "
+                f"test_acc={test_acc:.2f}%, detected={len(malicious_indices)}, 耗时={epoch_time:.2f}秒"
+            )
 
             # 定期清理GPU内存
             if torch.cuda.is_available() and epoch_num % 10 == 0:
                 torch.cuda.empty_cache()
-                self.logger.info("已清理GPU缓存")
+                self._log_verbose("已清理GPU缓存")
 
             round_compute_time = time.time() - round_start_time
             self.round_overhead[f"epoch_{epoch_num}"] = {
@@ -2610,7 +2653,7 @@ class FederatedLearning:
                 "validation_accuracy": val_acc,
                 "test_accuracy": test_acc
             }
-            self.logger.info(f"轮次 {epoch_num} 完成，耗时: {round_compute_time:.2f} 秒")
+            self._log_verbose(f"轮次 {epoch_num} 完成，耗时: {round_compute_time:.2f} 秒")
 
             epoch_num += 1
 
@@ -2783,7 +2826,7 @@ class FederatedLearning:
                     'correct': epoch_correct,
                     'total': epoch_total
                 })
-                self.logger.info(
+                self._log_verbose(
                     f"  - 本地轮次 {local_epoch}/{num_local_epochs - 1}: 损失 = {epoch_avg_loss:.4f}, 准确率 = {epoch_accuracy:.2f}%")
 
         # 计算客户端平均损失
@@ -2867,7 +2910,7 @@ class FederatedLearning:
                         probing_params.append(probed_update)
 
                     except Exception as e:
-                        print(f"生成诱导参数时出错: {str(e)}")
+                        self._log(f"生成诱导参数时出错，回退到随机噪声: {str(e)}", level="warning")
                         random_noise = torch.randn_like(update) * self.epsilon
                         probed_update = update + random_noise
                         probing_params.append(probed_update)
@@ -2879,7 +2922,10 @@ class FederatedLearning:
                 self.execution_time['generate_probing'] = time.time() - start_time
                 return torch.stack(probing_params)
 
-        return CustomWaveletDefender(model, nusers, input_shape=input_shape, device=self.device)
+        return CustomWaveletDefender(
+            model, nusers, input_shape=input_shape, device=self.device,
+            logger=self.logger, verbose=self.verbose_logging
+        )
 
     @staticmethod
     def _convert_to_serializable(obj):
@@ -2969,6 +3015,10 @@ class FederatedLearning:
                 adaptive_attack_weight=self.config.adaptive_attack_weight,
                 adaptive_scale_candidates=self.config.adaptive_scale_candidates,
                 attack_debug_enabled=self.config.attack_debug_enabled,
+                verbose_logging=self.config.verbose_logging,
+                data_debug_logging=self.config.data_debug_logging,
+                model_debug_logging=self.config.model_debug_logging,
+                save_all_snapshots=self.config.save_all_snapshots,
                 defense_enabled=self.config.defense_enabled,
                 seed=self.config.seed + i,  # 不同实验使用不同的种子
                 output_dir=exp_dir,
