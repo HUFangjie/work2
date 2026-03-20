@@ -86,6 +86,13 @@ class WaveletDefense:
         else:
             print(message)
 
+    def _infer_num_classes(self) -> int:
+        """尽量从模型中推断输出类别数。"""
+        for module in reversed(list(self.model.modules())):
+            if hasattr(module, "out_features"):
+                return int(module.out_features)
+        return 10
+
     def extract_feature_differences(self, original_updates, probed_updates):
         """
         提取原始更新与诱导更新之间的频域差分特征。
@@ -1508,7 +1515,7 @@ class WaveletDefense:
             try:
                 # 创建假输入数据
                 fake_input = torch.randn(1, *self.input_shape).to(self.device)
-                fake_target = torch.randint(0, 10, (1,)).to(self.device)
+                fake_target = torch.randint(0, self._infer_num_classes(), (1,)).to(self.device)
 
                 # 计算FGSM扰动
                 self.model.zero_grad()

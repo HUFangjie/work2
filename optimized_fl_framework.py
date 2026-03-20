@@ -28,6 +28,7 @@ import logging
 import json
 from typing import Dict, List, Tuple, Optional, Callable, Union, Any
 from dataclasses import dataclass, field
+from PIL import Image
 
 from scipy.stats import entropy
 from sklearn.metrics import confusion_matrix, precision_recall_fscore_support
@@ -46,7 +47,7 @@ from wavelet_defense import WaveletDefense
 class FLConfig:
     """联邦学习配置"""
     # 数据集配置
-    dataset: str = "cifar10"  # 'mnist', 'fashion-mnist', 'cifar10'
+    dataset: str = "cifar10"  # 'mnist', 'fashion-mnist', 'cifar10', 'tiny-imagenet'
     data_dir: str = "./data"
 
     # 系统配置
@@ -103,7 +104,7 @@ class FLConfig:
             raise ValueError(f"无效的偏移类型: {self.deviation_type}. 有效类型: {valid_dev_types}")
 
         # 验证数据集类型
-        valid_datasets = ['mnist', 'fashion-mnist', 'cifar10']
+        valid_datasets = ['mnist', 'fashion-mnist', 'cifar10', 'tiny-imagenet']
         if self.dataset not in valid_datasets:
             raise ValueError(f"无效的数据集类型: {self.dataset}. 有效类型: {valid_datasets}")
 
@@ -113,6 +114,12 @@ class FLConfig:
 
         # 设置设备
         self.device = torch.device("cuda" if torch.cuda.is_available() and self.use_gpu else "cpu")
+        self.num_classes = {
+            'mnist': 10,
+            'fashion-mnist': 10,
+            'cifar10': 10,
+            'tiny-imagenet': 200
+        }[self.dataset]
 
 
 @dataclass
@@ -179,7 +186,7 @@ class ModelFactory:
         """创建适合特定数据集的模型
 
         Args:
-            dataset_type: 数据集类型 ('mnist', 'fashion-mnist', 'cifar10')
+            dataset_type: 数据集类型 ('mnist', 'fashion-mnist', 'cifar10', 'tiny-imagenet')
             config: 联邦学习配置
 
         Returns:
@@ -200,19 +207,19 @@ class ModelFactory:
                 nn.Linear(9216, 128),
                 nn.ReLU(),
                 nn.Dropout2d(0.5),
-                nn.Linear(128, 10)
+                nn.Linear(128, config.num_classes)
             ).to(device)
 
             weight_decay = 5e-4
 
         elif dataset_type == 'fashion-mnist':
             # Fashion-MNIST优化模型
-            model = SimplifiedFashionMNISTNet(drop_rate=0.3).to(device)
+            model = SimplifiedFashionMNISTNet(drop_rate=0.3, num_classes=config.num_classes).to(device)
             weight_decay = 1e-4
 
-        elif dataset_type == 'cifar10':
-            # CIFAR-10优化的ResNet
-            model = ModelFactory.create_resnet34(drop_rate=0.2).to(device)
+        elif dataset_type in ['cifar10', 'tiny-imagenet']:
+            # CIFAR-10 / Tiny-ImageNet 使用ResNet
+            model = ModelFactory.create_resnet34(drop_rate=0.2, num_classes=config.num_classes).to(device)
             weight_decay = 1e-4
 
         else:
@@ -229,14 +236,14 @@ class ModelFactory:
         return model, optimizer
 
     @staticmethod
-    def create_resnet18(drop_rate: float = 0.2) -> nn.Module:
+    def create_resnet18(drop_rate: float = 0.2, num_classes: int = 10) -> nn.Module:
         """创建ResNet-18模型"""
-        return CIFAR10ResNet(BasicBlock, [2, 2, 2, 2], drop_rate=drop_rate)
+        return CIFAR10ResNet(BasicBlock, [2, 2, 2, 2], num_classes=num_classes, drop_rate=drop_rate)
 
     @staticmethod
-    def create_resnet34(drop_rate: float = 0.2) -> nn.Module:
+    def create_resnet34(drop_rate: float = 0.2, num_classes: int = 10) -> nn.Module:
         """创建ResNet-34模型"""
-        return CIFAR10ResNet(BasicBlock, [3, 4, 6, 3], drop_rate=drop_rate)
+        return CIFAR10ResNet(BasicBlock, [3, 4, 6, 3], num_classes=num_classes, drop_rate=drop_rate)
 
 
 # CIFAR-10专用的ResNet模型
@@ -393,7 +400,7 @@ class SpatialAttention(nn.Module):
 class SimplifiedFashionMNISTNet(nn.Module):
     """为Fashion-MNIST优化的简化网络架构"""
 
-    def __init__(self, drop_rate: float = 0.3):
+    def __init__(self, drop_rate: float = 0.3, num_classes: int = 10):
         super(SimplifiedFashionMNISTNet, self).__init__()
         self.conv1 = nn.Sequential(
             nn.Conv2d(1, 32, kernel_size=5, padding=2),
@@ -424,7 +431,7 @@ class SimplifiedFashionMNISTNet(nn.Module):
             nn.BatchNorm1d(256),
             nn.ReLU(),
             nn.Dropout(drop_rate),
-            nn.Linear(256, 10)
+            nn.Linear(256, num_classes)
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -1237,6 +1244,83 @@ class DataManager:
     # 添加到DataManager类中的方法
 
     @staticmethod
+    def _resolve_tiny_imagenet_root(data_dir: str) -> str:
+        """解析 tiny-ImageNet 本地目录。"""
+        candidates = [
+            data_dir,
+            os.path.join(data_dir, "tiny-imagenet-200"),
+            os.path.join(data_dir, "tiny-imagenet"),
+            os.path.join(os.getcwd(), "tiny-imagenet-200"),
+            os.path.join(os.getcwd(), "tiny-imagenet"),
+        ]
+
+        for candidate in candidates:
+            if os.path.isdir(os.path.join(candidate, "train")) and os.path.isdir(os.path.join(candidate, "val")):
+                return candidate
+
+        raise FileNotFoundError(
+            "未找到 tiny-ImageNet 数据目录。请将 tiny-imagenet-200 或 tiny-imagenet 放在当前工程目录，"
+            "或通过 config.data_dir 指向其父目录/根目录。"
+        )
+
+    @staticmethod
+    def _load_tiny_imagenet_images(root_dir: str) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """从标准 tiny-ImageNet 目录中读取训练集与验证集图像。"""
+        to_tensor = transforms.ToTensor()
+
+        wnids_path = os.path.join(root_dir, "wnids.txt")
+        with open(wnids_path, "r") as f:
+            wnids = [line.strip() for line in f if line.strip()]
+        class_to_idx = {wnid: idx for idx, wnid in enumerate(wnids)}
+
+        train_images = []
+        train_labels = []
+
+        # train/<wnid>/images/*.JPEG
+        train_dir = os.path.join(root_dir, "train")
+        for wnid in wnids:
+            image_dir = os.path.join(train_dir, wnid, "images")
+            if not os.path.isdir(image_dir):
+                continue
+            for image_name in sorted(os.listdir(image_dir)):
+                image_path = os.path.join(image_dir, image_name)
+                if not os.path.isfile(image_path):
+                    continue
+                with Image.open(image_path) as img:
+                    train_images.append(to_tensor(img.convert("RGB")))
+                train_labels.append(class_to_idx[wnid])
+
+        # val/images + val_annotations.txt
+        val_images = []
+        val_labels = []
+        val_dir = os.path.join(root_dir, "val")
+        val_annotations = os.path.join(val_dir, "val_annotations.txt")
+        val_images_dir = os.path.join(val_dir, "images")
+        if os.path.isfile(val_annotations) and os.path.isdir(val_images_dir):
+            with open(val_annotations, "r") as f:
+                for line in f:
+                    parts = line.strip().split("\t")
+                    if len(parts) < 2:
+                        continue
+                    image_name, wnid = parts[0], parts[1]
+                    image_path = os.path.join(val_images_dir, image_name)
+                    if wnid not in class_to_idx or not os.path.isfile(image_path):
+                        continue
+                    with Image.open(image_path) as img:
+                        val_images.append(to_tensor(img.convert("RGB")))
+                    val_labels.append(class_to_idx[wnid])
+
+        if not train_images or not val_images:
+            raise RuntimeError(f"在 {root_dir} 中未读取到 tiny-ImageNet 图像")
+
+        return (
+            torch.stack(train_images),
+            torch.tensor(train_labels, dtype=torch.long),
+            torch.stack(val_images),
+            torch.tensor(val_labels, dtype=torch.long)
+        )
+
+    @staticmethod
     def create_non_iid_partition(labels, num_clients, alpha, seed=42):
         """
         使用Dirichlet分布创建non-IID数据分区
@@ -1497,6 +1581,12 @@ class DataManager:
             val_len = 5000
             te_len = 5000
             num_classes = 10
+        elif dataset == 'tiny-imagenet':
+            tiny_root = DataManager._resolve_tiny_imagenet_root(data_dir)
+            emit(f"使用本地 tiny-ImageNet 数据目录: {tiny_root}")
+            val_len = 5000
+            te_len = 5000
+            num_classes = 200
         else:
             raise ValueError(f"不支持的数据集: {dataset}")
 
@@ -1511,11 +1601,39 @@ class DataManager:
         elif dataset == 'cifar10':
             raw_train_dataset = CIFAR10(root=data_dir, train=True, download=True, transform=None)
             raw_test_dataset = CIFAR10(root=data_dir, train=False, download=True, transform=None)
+        elif dataset == 'tiny-imagenet':
+            train_data, train_labels, eval_data, eval_labels = DataManager._load_tiny_imagenet_images(tiny_root)
+
+            val_actual_len = min(val_len, len(eval_labels) // 2)
+            test_actual_len = len(eval_labels) - val_actual_len
+            if val_actual_len == 0 or test_actual_len == 0:
+                raise RuntimeError("tiny-ImageNet 验证/测试划分失败，请检查数据目录是否完整")
+
+            eval_indices = torch.randperm(len(eval_labels))
+            val_indices = eval_indices[:val_actual_len]
+            test_indices = eval_indices[val_actual_len:]
+
+            val_data = eval_data[val_indices]
+            val_labels = eval_labels[val_indices]
+            test_data = eval_data[test_indices]
+            test_labels = eval_labels[test_indices]
 
         emit(f"验证/测试预留大小: val={val_len}, test={te_len}", verbose_only=True)
 
         # 获取原始数据和标签
-        if dataset == 'mnist' or dataset == 'fashion-mnist':
+        if dataset == 'tiny-imagenet':
+            all_labels = torch.cat([train_labels, eval_labels])
+            label_counts = {}
+            for label in range(num_classes):
+                label_counts[label] = (all_labels == label).sum().item()
+
+            emit(
+                f"原始数据集总样本数: {len(all_labels)}，类别数: {num_classes}，"
+                f"各类最小/最大样本数: {min(label_counts.values())}/{max(label_counts.values())}"
+            )
+            emit(f"数据切分完成: train={len(train_data)}, val={len(val_data)}, test={len(test_data)}")
+
+        elif dataset == 'mnist' or dataset == 'fashion-mnist':
             # 检查数据是否已经是张量(PyTorch 1.x+)
             if isinstance(raw_train_dataset.data, torch.Tensor):
                 train_images = raw_train_dataset.data.float() / 255.0  # 归一化到[0,1]
@@ -1545,43 +1663,40 @@ class DataManager:
             train_labels = torch.tensor(raw_train_dataset.targets)
             test_labels = torch.tensor(raw_test_dataset.targets)
 
-        # 合并所有数据
-        all_images = torch.cat([train_images, test_images])
-        all_labels = torch.cat([train_labels, test_labels])
+        if dataset != 'tiny-imagenet':
+            # 合并所有数据
+            all_images = torch.cat([train_images, test_images])
+            all_labels = torch.cat([train_labels, test_labels])
 
-        # 检查各个类别的样本数量
-        label_counts = {}
-        for label in range(num_classes):
-            label_counts[label] = (all_labels == label).sum().item()
+            # 检查各个类别的样本数量
+            label_counts = {}
+            for label in range(num_classes):
+                label_counts[label] = (all_labels == label).sum().item()
 
-        emit(
-            f"原始数据集总样本数: {len(all_labels)}，类别数: {num_classes}，"
-            f"各类最小/最大样本数: {min(label_counts.values())}/{max(label_counts.values())}"
-        )
-        if config.data_debug_logging:
-            for label, count in label_counts.items():
-                emit(f"  类别 {label}: {count}样本")
+            emit(
+                f"原始数据集总样本数: {len(all_labels)}，类别数: {num_classes}，"
+                f"各类最小/最大样本数: {min(label_counts.values())}/{max(label_counts.values())}"
+            )
+            if config.data_debug_logging:
+                for label, count in label_counts.items():
+                    emit(f"  类别 {label}: {count}样本")
 
-        # 分割训练、验证和测试集
-        # 先随机打乱索引
-        indices = torch.randperm(len(all_labels))
+            # 分割训练、验证和测试集
+            indices = torch.randperm(len(all_labels))
+            val_indices = indices[:val_len]
+            test_indices = indices[val_len:val_len + te_len]
+            train_indices = indices[val_len + te_len:]
 
-        # 分配样本到验证集和测试集，其余用于训练
-        val_indices = indices[:val_len]
-        test_indices = indices[val_len:val_len + te_len]
-        train_indices = indices[val_len + te_len:]
+            train_data = all_images[train_indices]
+            train_labels = all_labels[train_indices]
 
-        # 提取数据
-        train_data = all_images[train_indices]
-        train_labels = all_labels[train_indices]
+            val_data = all_images[val_indices]
+            val_labels = all_labels[val_indices]
 
-        val_data = all_images[val_indices]
-        val_labels = all_labels[val_indices]
+            test_data = all_images[test_indices]
+            test_labels = all_labels[test_indices]
 
-        test_data = all_images[test_indices]
-        test_labels = all_labels[test_indices]
-
-        emit(f"数据切分完成: train={len(train_indices)}, val={len(val_indices)}, test={len(test_indices)}")
+            emit(f"数据切分完成: train={len(train_indices)}, val={len(val_indices)}, test={len(test_indices)}")
 
         # 数据分区
         if is_iid:
@@ -1652,6 +1767,13 @@ class DataManager:
             # CIFAR10标准化
             mean = torch.tensor([0.4914, 0.4822, 0.4465]).view(3, 1, 1)
             std = torch.tensor([0.2470, 0.2435, 0.2616]).view(3, 1, 1)
+            for i in range(len(user_train_data)):
+                user_train_data[i] = (user_train_data[i] - mean) / std
+            val_data = (val_data - mean) / std
+            test_data = (test_data - mean) / std
+        elif dataset == 'tiny-imagenet':
+            mean = torch.tensor([0.4802, 0.4481, 0.3975]).view(3, 1, 1)
+            std = torch.tensor([0.2302, 0.2265, 0.2262]).view(3, 1, 1)
             for i in range(len(user_train_data)):
                 user_train_data[i] = (user_train_data[i] - mean) / std
             val_data = (val_data - mean) / std
@@ -2887,7 +3009,7 @@ class FederatedLearning:
                     try:
                         # 创建批次大小为2的假输入数据
                         fake_input = torch.randn(2, *self.input_shape).to(self.device)
-                        fake_target = torch.randint(0, 10, (2,)).to(self.device)
+                        fake_target = torch.randint(0, self._infer_num_classes(), (2,)).to(self.device)
 
                         # 计算FGSM扰动
                         self.model.zero_grad()
@@ -3147,7 +3269,7 @@ def main():
         config)
 
     # 可视化客户端数据分布
-    num_classes = 10  # CIFAR-10有10个类别
+    num_classes = config.num_classes
     DataManager.visualize_label_distribution(
         user_tr_label_tensors,
         num_classes,
