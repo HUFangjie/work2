@@ -28,6 +28,7 @@ import logging
 import json
 from typing import Dict, List, Tuple, Optional, Callable, Union, Any
 from dataclasses import dataclass, field
+from PIL import Image
 
 from scipy.stats import entropy
 from sklearn.metrics import confusion_matrix, precision_recall_fscore_support
@@ -46,7 +47,7 @@ from wavelet_defense import WaveletDefense
 class FLConfig:
     """联邦学习配置"""
     # 数据集配置
-    dataset: str = "cifar10"  # 'mnist', 'fashion-mnist', 'cifar10'
+    dataset: str = "cifar10"  # 'mnist', 'fashion-mnist', 'cifar10', 'tiny-imagenet'
     data_dir: str = "./data"
 
     # 系统配置
@@ -62,8 +63,15 @@ class FLConfig:
     num_local_epochs: int = 1  # 每个客户端本地训练轮数
 
     # 攻击配置
-    attack_type: str = "fang"  # 'lie', 'fang', 'agr', 'min-max', 'min-sum'
+    attack_type: str = "fang"  # 'lie', 'fang', 'agr', 'min-max', 'min-sum', 'adaptive'
     deviation_type: str = "unit_vec"  # 'unit_vec', 'sign', 'std'
+    adaptive_attack_weight: float = 0.5
+    adaptive_scale_candidates: Tuple[float, ...] = (0.5, 1.0, 2.0, 5.0, 10.0)
+    attack_debug_enabled: bool = True
+    verbose_logging: bool = False
+    data_debug_logging: bool = False
+    model_debug_logging: bool = False
+    save_all_snapshots: bool = False
 
     # 防御配置
     defense_enabled: bool = True
@@ -86,7 +94,7 @@ class FLConfig:
     def __post_init__(self):
         """执行验证并设置派生参数"""
         # 验证攻击类型
-        valid_attack_types = ['lie', 'fang', 'agr', 'min-max', 'min-sum']
+        valid_attack_types = ['lie', 'fang', 'agr', 'min-max', 'min-sum', 'adaptive']
         if self.attack_type not in valid_attack_types:
             raise ValueError(f"无效的攻击类型: {self.attack_type}. 有效类型: {valid_attack_types}")
 
@@ -96,7 +104,7 @@ class FLConfig:
             raise ValueError(f"无效的偏移类型: {self.deviation_type}. 有效类型: {valid_dev_types}")
 
         # 验证数据集类型
-        valid_datasets = ['mnist', 'fashion-mnist', 'cifar10']
+        valid_datasets = ['mnist', 'fashion-mnist', 'cifar10', 'tiny-imagenet']
         if self.dataset not in valid_datasets:
             raise ValueError(f"无效的数据集类型: {self.dataset}. 有效类型: {valid_datasets}")
 
@@ -106,6 +114,21 @@ class FLConfig:
 
         # 设置设备
         self.device = torch.device("cuda" if torch.cuda.is_available() and self.use_gpu else "cpu")
+        self.num_classes = {
+            'mnist': 10,
+            'fashion-mnist': 10,
+            'cifar10': 10,
+            'tiny-imagenet': 200
+        }[self.dataset]
+
+
+@dataclass
+class AttackContext:
+    """攻击构造所需的上下文，便于复用与调试。"""
+    defender: Optional[WaveletDefense] = None
+    benign_feature_prototype: Optional[np.ndarray] = None
+    epoch_num: int = 0
+    debug_store: Optional[List[Dict[str, Any]]] = None
 
 
 # =========================================================
@@ -116,7 +139,7 @@ class LoggerFactory:
     """日志工厂类，用于创建和管理日志记录器"""
 
     @staticmethod
-    def setup_logger(name: str, log_dir: str = 'logs') -> logging.Logger:
+    def setup_logger(name: str, log_dir: str = 'logs', level: int = logging.INFO) -> logging.Logger:
         """设置日志记录器
 
         Args:
@@ -136,7 +159,7 @@ class LoggerFactory:
 
         # 避免重复配置
         if not logger.handlers:
-            logger.setLevel(logging.INFO)
+            logger.setLevel(level)
 
             # 文件处理器
             file_handler = logging.FileHandler(log_file)
@@ -163,7 +186,7 @@ class ModelFactory:
         """创建适合特定数据集的模型
 
         Args:
-            dataset_type: 数据集类型 ('mnist', 'fashion-mnist', 'cifar10')
+            dataset_type: 数据集类型 ('mnist', 'fashion-mnist', 'cifar10', 'tiny-imagenet')
             config: 联邦学习配置
 
         Returns:
@@ -184,19 +207,19 @@ class ModelFactory:
                 nn.Linear(9216, 128),
                 nn.ReLU(),
                 nn.Dropout2d(0.5),
-                nn.Linear(128, 10)
+                nn.Linear(128, config.num_classes)
             ).to(device)
 
             weight_decay = 5e-4
 
         elif dataset_type == 'fashion-mnist':
             # Fashion-MNIST优化模型
-            model = SimplifiedFashionMNISTNet(drop_rate=0.3).to(device)
+            model = SimplifiedFashionMNISTNet(drop_rate=0.3, num_classes=config.num_classes).to(device)
             weight_decay = 1e-4
 
-        elif dataset_type == 'cifar10':
-            # CIFAR-10优化的ResNet
-            model = ModelFactory.create_resnet34(drop_rate=0.2).to(device)
+        elif dataset_type in ['cifar10', 'tiny-imagenet']:
+            # CIFAR-10 / Tiny-ImageNet 使用ResNet
+            model = ModelFactory.create_resnet34(drop_rate=0.2, num_classes=config.num_classes).to(device)
             weight_decay = 1e-4
 
         else:
@@ -213,14 +236,14 @@ class ModelFactory:
         return model, optimizer
 
     @staticmethod
-    def create_resnet18(drop_rate: float = 0.2) -> nn.Module:
+    def create_resnet18(drop_rate: float = 0.2, num_classes: int = 10) -> nn.Module:
         """创建ResNet-18模型"""
-        return CIFAR10ResNet(BasicBlock, [2, 2, 2, 2], drop_rate=drop_rate)
+        return CIFAR10ResNet(BasicBlock, [2, 2, 2, 2], num_classes=num_classes, drop_rate=drop_rate)
 
     @staticmethod
-    def create_resnet34(drop_rate: float = 0.2) -> nn.Module:
+    def create_resnet34(drop_rate: float = 0.2, num_classes: int = 10) -> nn.Module:
         """创建ResNet-34模型"""
-        return CIFAR10ResNet(BasicBlock, [3, 4, 6, 3], drop_rate=drop_rate)
+        return CIFAR10ResNet(BasicBlock, [3, 4, 6, 3], num_classes=num_classes, drop_rate=drop_rate)
 
 
 # CIFAR-10专用的ResNet模型
@@ -377,7 +400,7 @@ class SpatialAttention(nn.Module):
 class SimplifiedFashionMNISTNet(nn.Module):
     """为Fashion-MNIST优化的简化网络架构"""
 
-    def __init__(self, drop_rate: float = 0.3):
+    def __init__(self, drop_rate: float = 0.3, num_classes: int = 10):
         super(SimplifiedFashionMNISTNet, self).__init__()
         self.conv1 = nn.Sequential(
             nn.Conv2d(1, 32, kernel_size=5, padding=2),
@@ -408,7 +431,7 @@ class SimplifiedFashionMNISTNet(nn.Module):
             nn.BatchNorm1d(256),
             nn.ReLU(),
             nn.Dropout(drop_rate),
-            nn.Linear(256, 10)
+            nn.Linear(256, num_classes)
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -546,17 +569,12 @@ class DefenseEvaluator:
 
     def print_round_stats(self, round_stats: Dict[str, float]) -> None:
         """打印单轮统计信息"""
-        print("\n=== 防御性能 ===")
-        print(f"选中的客户端总数: {round_stats['total_selected']}")
-        print(f"检测到的恶意客户端: {round_stats['detected_malicious']}/{self.n_attackers}")
-        print(f"逃过检测的恶意客户端: {round_stats['missed_malicious']}")
-        print(f"误判的良性客户端: {round_stats['false_positives']}")
-        print(f"检测率: {round_stats['detection_rate']:.2%}")
-        print(f"误报率: {round_stats['false_positive_rate']:.2%}")
-        print(f"精确度: {round_stats['precision']:.2%}")
-        print(f"召回率: {round_stats['recall']:.2%}")
-        print(f"F1分数: {round_stats['f1_score']:.2%}")
-        print(f"准确率: {round_stats['accuracy']:.2%}")
+        print(
+            f"防御统计[epoch={round_stats['epoch']}]: detected={round_stats['detected_malicious']}/{self.n_attackers}, "
+            f"missed={round_stats['missed_malicious']}, fp={round_stats['false_positives']}, "
+            f"recall={round_stats['recall']:.2%}, precision={round_stats['precision']:.2%}, "
+            f"f1={round_stats['f1_score']:.2%}, acc={round_stats['accuracy']:.2%}"
+        )
 
     def get_summary(self) -> Optional[Dict[str, float]]:
         """获取整体统计信息"""
@@ -587,15 +605,25 @@ class DefenseEvaluator:
             return
 
         df = pd.DataFrame(self.stats)
+        epochs = df['epoch'].to_numpy()
+        detection_rate = df['detection_rate'].to_numpy()
+        false_positive_rate = df['false_positive_rate'].to_numpy()
+        precision = df['precision'].to_numpy()
+        recall = df['recall'].to_numpy()
+        f1_score = df['f1_score'].to_numpy()
+        accuracy = df['accuracy'].to_numpy()
+        detected_malicious = df['detected_malicious'].to_numpy()
+        missed_malicious = df['missed_malicious'].to_numpy()
+        total_selected = df['total_selected'].to_numpy()
 
         plt.figure(figsize=(15, 12))
 
         # 检测率、误报率、精确度和召回率
         plt.subplot(2, 2, 1)
-        plt.plot(df['epoch'], df['detection_rate'], 'g-', label='检测率')
-        plt.plot(df['epoch'], df['false_positive_rate'], 'r-', label='误报率')
-        plt.plot(df['epoch'], df['precision'], 'b--', label='精确度')
-        plt.plot(df['epoch'], df['recall'], 'm--', label='召回率')
+        plt.plot(epochs, detection_rate, 'g-', label='检测率')
+        plt.plot(epochs, false_positive_rate, 'r-', label='误报率')
+        plt.plot(epochs, precision, 'b--', label='精确度')
+        plt.plot(epochs, recall, 'm--', label='召回率')
         plt.xlabel('轮次')
         plt.ylabel('比率')
         plt.title('检测性能')
@@ -604,8 +632,8 @@ class DefenseEvaluator:
 
         # F1分数和准确率
         plt.subplot(2, 2, 2)
-        plt.plot(df['epoch'], df['f1_score'], 'g-', label='F1分数')
-        plt.plot(df['epoch'], df['accuracy'], 'b-', label='准确率')
+        plt.plot(epochs, f1_score, 'g-', label='F1分数')
+        plt.plot(epochs, accuracy, 'b-', label='准确率')
         plt.xlabel('轮次')
         plt.ylabel('分数')
         plt.title('综合性能指标')
@@ -614,12 +642,12 @@ class DefenseEvaluator:
 
         # 检测到和未检测到的恶意客户端数量
         plt.subplot(2, 2, 3)
-        plt.stackplot(df['epoch'],
-                      df['detected_malicious'],
-                      df['missed_malicious'],
+        plt.stackplot(epochs,
+                      detected_malicious,
+                      missed_malicious,
                       labels=['检测到的恶意客户端', '未检测到的恶意客户端'],
                       colors=['g', 'r'])
-        plt.plot(df['epoch'], [self.n_attackers] * len(df), 'k--', label='恶意客户端总数')
+        plt.plot(epochs, [self.n_attackers] * len(df), 'k--', label='恶意客户端总数')
         plt.xlabel('轮次')
         plt.ylabel('客户端数量')
         plt.title('恶意客户端检测情况')
@@ -628,10 +656,10 @@ class DefenseEvaluator:
 
         # 选中的客户端数量
         plt.subplot(2, 2, 4)
-        plt.plot(df['epoch'], df['total_selected'], 'b-', label='选中的客户端总数')
-        plt.plot(df['epoch'], df['total_selected'] - df['missed_malicious'], 'g-', label='良性客户端数量')
-        plt.plot(df['epoch'], [self.n_clients] * len(df), 'k--', label='客户端总数')
-        plt.plot(df['epoch'], [self.n_clients - self.n_attackers] * len(df), 'k:', label='良性客户端总数')
+        plt.plot(epochs, total_selected, 'b-', label='选中的客户端总数')
+        plt.plot(epochs, total_selected - missed_malicious, 'g-', label='良性客户端数量')
+        plt.plot(epochs, [self.n_clients] * len(df), 'k--', label='客户端总数')
+        plt.plot(epochs, [self.n_clients - self.n_attackers] * len(df), 'k:', label='良性客户端总数')
         plt.xlabel('轮次')
         plt.ylabel('客户端数量')
         plt.title('客户端选择情况')
@@ -665,7 +693,7 @@ class AttackFactory:
     """攻击策略工厂类"""
 
     @staticmethod
-    def create_attack(attack_type: str, config: FLConfig) -> Callable:
+    def create_attack(attack_type: str, config: FLConfig, attack_context: Optional[AttackContext] = None) -> Callable:
         """创建指定类型的攻击函数
 
         Args:
@@ -694,6 +722,10 @@ class AttackFactory:
         elif attack_type == 'min-sum':
             return lambda all_updates, model_re, n_attackers: AttackFactory.min_sum_attack(
                 all_updates, model_re, n_attackers, config.deviation_type, config.device
+            )
+        elif attack_type == 'adaptive':
+            return lambda all_updates, model_re, n_attackers: AttackFactory.adaptive_attack(
+                all_updates, model_re, n_attackers, config, attack_context
             )
         else:
             raise ValueError(f"不支持的攻击类型: {attack_type}")
@@ -1136,6 +1168,71 @@ class AttackFactory:
             # 出错时生成一个安全的恶意更新
             return -0.2 * model_re.detach().clone()
 
+    @staticmethod
+    def adaptive_attack(all_updates: torch.Tensor, model_re: torch.Tensor,
+                        n_attackers: int, config: FLConfig,
+                        attack_context: Optional[AttackContext]) -> torch.Tensor:
+        """
+        防御感知自适应攻击：
+        在原有投毒目标与防御特征伪装目标之间做折中，便于后续比较实验。
+        """
+        try:
+            if len(all_updates) == 0:
+                return -0.2 * model_re.detach().clone()
+
+            deviation = AttackFactory.get_deviation_vector(model_re, all_updates, config.deviation_type)
+            deviation_norm = torch.norm(deviation)
+            if deviation_norm.item() == 0:
+                deviation = torch.sign(model_re)
+                deviation_norm = torch.norm(deviation) + 1e-12
+            deviation = deviation / (deviation_norm + 1e-12)
+
+            benign_mean = torch.mean(all_updates, dim=0)
+            baseline_distance = torch.norm(model_re - benign_mean) + 1e-12
+            best_candidate = None
+            best_score = None
+            candidate_debug = []
+
+            for scale in config.adaptive_scale_candidates:
+                candidate = model_re - float(scale) * deviation * baseline_distance
+                poison_score = torch.norm(candidate - benign_mean).item()
+                evade_distance = 0.0
+
+                if attack_context and attack_context.defender and attack_context.benign_feature_prototype is not None:
+                    defender = attack_context.defender
+                    with torch.enable_grad():
+                        candidate_updates = torch.stack([candidate.detach()])
+                        candidate_probed = defender.generate_probing_parameters(candidate_updates)
+                        candidate_features = defender.extract_feature_differences(
+                            candidate_updates, candidate_probed
+                        )
+
+                    if len(candidate_features) > 0 and len(attack_context.benign_feature_prototype) > 0:
+                        evade_distance = float(np.linalg.norm(
+                            candidate_features[0] - attack_context.benign_feature_prototype
+                        ))
+
+                total_score = poison_score - config.adaptive_attack_weight * evade_distance
+                candidate_debug.append({
+                    "epoch": attack_context.epoch_num if attack_context else -1,
+                    "scale": float(scale),
+                    "poison_score": float(poison_score),
+                    "evasion_distance": float(evade_distance),
+                    "total_score": float(total_score)
+                })
+
+                if best_score is None or total_score > best_score:
+                    best_score = total_score
+                    best_candidate = candidate
+
+            if attack_context and attack_context.debug_store is not None and config.attack_debug_enabled:
+                attack_context.debug_store.extend(candidate_debug)
+
+            return best_candidate if best_candidate is not None else (-0.2 * model_re.detach().clone())
+        except Exception as e:
+            print(f"自适应攻击生成失败: {str(e)}")
+            return -0.2 * model_re.detach().clone()
+
 
 # =========================================================
 # 数据加载和处理
@@ -1145,6 +1242,83 @@ class DataManager:
     """数据管理类 - 负责加载和分割数据集"""
 
     # 添加到DataManager类中的方法
+
+    @staticmethod
+    def _resolve_tiny_imagenet_root(data_dir: str) -> str:
+        """解析 tiny-ImageNet 本地目录。"""
+        candidates = [
+            data_dir,
+            os.path.join(data_dir, "tiny-imagenet-200"),
+            os.path.join(data_dir, "tiny-imagenet"),
+            os.path.join(os.getcwd(), "tiny-imagenet-200"),
+            os.path.join(os.getcwd(), "tiny-imagenet"),
+        ]
+
+        for candidate in candidates:
+            if os.path.isdir(os.path.join(candidate, "train")) and os.path.isdir(os.path.join(candidate, "val")):
+                return candidate
+
+        raise FileNotFoundError(
+            "未找到 tiny-ImageNet 数据目录。请将 tiny-imagenet-200 或 tiny-imagenet 放在当前工程目录，"
+            "或通过 config.data_dir 指向其父目录/根目录。"
+        )
+
+    @staticmethod
+    def _load_tiny_imagenet_images(root_dir: str) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """从标准 tiny-ImageNet 目录中读取训练集与验证集图像。"""
+        to_tensor = transforms.ToTensor()
+
+        wnids_path = os.path.join(root_dir, "wnids.txt")
+        with open(wnids_path, "r") as f:
+            wnids = [line.strip() for line in f if line.strip()]
+        class_to_idx = {wnid: idx for idx, wnid in enumerate(wnids)}
+
+        train_images = []
+        train_labels = []
+
+        # train/<wnid>/images/*.JPEG
+        train_dir = os.path.join(root_dir, "train")
+        for wnid in wnids:
+            image_dir = os.path.join(train_dir, wnid, "images")
+            if not os.path.isdir(image_dir):
+                continue
+            for image_name in sorted(os.listdir(image_dir)):
+                image_path = os.path.join(image_dir, image_name)
+                if not os.path.isfile(image_path):
+                    continue
+                with Image.open(image_path) as img:
+                    train_images.append(to_tensor(img.convert("RGB")))
+                train_labels.append(class_to_idx[wnid])
+
+        # val/images + val_annotations.txt
+        val_images = []
+        val_labels = []
+        val_dir = os.path.join(root_dir, "val")
+        val_annotations = os.path.join(val_dir, "val_annotations.txt")
+        val_images_dir = os.path.join(val_dir, "images")
+        if os.path.isfile(val_annotations) and os.path.isdir(val_images_dir):
+            with open(val_annotations, "r") as f:
+                for line in f:
+                    parts = line.strip().split("\t")
+                    if len(parts) < 2:
+                        continue
+                    image_name, wnid = parts[0], parts[1]
+                    image_path = os.path.join(val_images_dir, image_name)
+                    if wnid not in class_to_idx or not os.path.isfile(image_path):
+                        continue
+                    with Image.open(image_path) as img:
+                        val_images.append(to_tensor(img.convert("RGB")))
+                    val_labels.append(class_to_idx[wnid])
+
+        if not train_images or not val_images:
+            raise RuntimeError(f"在 {root_dir} 中未读取到 tiny-ImageNet 图像")
+
+        return (
+            torch.stack(train_images),
+            torch.tensor(train_labels, dtype=torch.long),
+            torch.stack(val_images),
+            torch.tensor(val_labels, dtype=torch.long)
+        )
 
     @staticmethod
     def create_non_iid_partition(labels, num_clients, alpha, seed=42):
@@ -1332,7 +1506,12 @@ class DataManager:
         torch.manual_seed(config.seed)
         np.random.seed(config.seed)
 
-        print(f"加载 {dataset} 数据集")
+        def emit(message: str, verbose_only: bool = False) -> None:
+            if verbose_only and not config.data_debug_logging:
+                return
+            print(message)
+
+        emit(f"加载 {dataset} 数据集")
 
         # 根据数据集类型选择不同的转换和加载方法
         if dataset == 'mnist':
@@ -1402,6 +1581,12 @@ class DataManager:
             val_len = 5000
             te_len = 5000
             num_classes = 10
+        elif dataset == 'tiny-imagenet':
+            tiny_root = DataManager._resolve_tiny_imagenet_root(data_dir)
+            emit(f"使用本地 tiny-ImageNet 数据目录: {tiny_root}")
+            val_len = 5000
+            te_len = 5000
+            num_classes = 200
         else:
             raise ValueError(f"不支持的数据集: {dataset}")
 
@@ -1416,12 +1601,39 @@ class DataManager:
         elif dataset == 'cifar10':
             raw_train_dataset = CIFAR10(root=data_dir, train=True, download=True, transform=None)
             raw_test_dataset = CIFAR10(root=data_dir, train=False, download=True, transform=None)
+        elif dataset == 'tiny-imagenet':
+            train_data, train_labels, eval_data, eval_labels = DataManager._load_tiny_imagenet_images(tiny_root)
 
-        print(f"验证集大小: {val_len}")
-        print(f"测试集大小: {te_len}")
+            val_actual_len = min(val_len, len(eval_labels) // 2)
+            test_actual_len = len(eval_labels) - val_actual_len
+            if val_actual_len == 0 or test_actual_len == 0:
+                raise RuntimeError("tiny-ImageNet 验证/测试划分失败，请检查数据目录是否完整")
+
+            eval_indices = torch.randperm(len(eval_labels))
+            val_indices = eval_indices[:val_actual_len]
+            test_indices = eval_indices[val_actual_len:]
+
+            val_data = eval_data[val_indices]
+            val_labels = eval_labels[val_indices]
+            test_data = eval_data[test_indices]
+            test_labels = eval_labels[test_indices]
+
+        emit(f"验证/测试预留大小: val={val_len}, test={te_len}", verbose_only=True)
 
         # 获取原始数据和标签
-        if dataset == 'mnist' or dataset == 'fashion-mnist':
+        if dataset == 'tiny-imagenet':
+            all_labels = torch.cat([train_labels, eval_labels])
+            label_counts = {}
+            for label in range(num_classes):
+                label_counts[label] = (all_labels == label).sum().item()
+
+            emit(
+                f"原始数据集总样本数: {len(all_labels)}，类别数: {num_classes}，"
+                f"各类最小/最大样本数: {min(label_counts.values())}/{max(label_counts.values())}"
+            )
+            emit(f"数据切分完成: train={len(train_data)}, val={len(val_data)}, test={len(test_data)}")
+
+        elif dataset == 'mnist' or dataset == 'fashion-mnist':
             # 检查数据是否已经是张量(PyTorch 1.x+)
             if isinstance(raw_train_dataset.data, torch.Tensor):
                 train_images = raw_train_dataset.data.float() / 255.0  # 归一化到[0,1]
@@ -1451,45 +1663,44 @@ class DataManager:
             train_labels = torch.tensor(raw_train_dataset.targets)
             test_labels = torch.tensor(raw_test_dataset.targets)
 
-        # 合并所有数据
-        all_images = torch.cat([train_images, test_images])
-        all_labels = torch.cat([train_labels, test_labels])
+        if dataset != 'tiny-imagenet':
+            # 合并所有数据
+            all_images = torch.cat([train_images, test_images])
+            all_labels = torch.cat([train_labels, test_labels])
 
-        # 检查各个类别的样本数量
-        label_counts = {}
-        for label in range(num_classes):
-            label_counts[label] = (all_labels == label).sum().item()
+            # 检查各个类别的样本数量
+            label_counts = {}
+            for label in range(num_classes):
+                label_counts[label] = (all_labels == label).sum().item()
 
-        print("全部数据中各类别样本数:")
-        for label, count in label_counts.items():
-            print(f"  类别 {label}: {count}样本")
+            emit(
+                f"原始数据集总样本数: {len(all_labels)}，类别数: {num_classes}，"
+                f"各类最小/最大样本数: {min(label_counts.values())}/{max(label_counts.values())}"
+            )
+            if config.data_debug_logging:
+                for label, count in label_counts.items():
+                    emit(f"  类别 {label}: {count}样本")
 
-        # 分割训练、验证和测试集
-        # 先随机打乱索引
-        indices = torch.randperm(len(all_labels))
+            # 分割训练、验证和测试集
+            indices = torch.randperm(len(all_labels))
+            val_indices = indices[:val_len]
+            test_indices = indices[val_len:val_len + te_len]
+            train_indices = indices[val_len + te_len:]
 
-        # 分配样本到验证集和测试集，其余用于训练
-        val_indices = indices[:val_len]
-        test_indices = indices[val_len:val_len + te_len]
-        train_indices = indices[val_len + te_len:]
+            train_data = all_images[train_indices]
+            train_labels = all_labels[train_indices]
 
-        # 提取数据
-        train_data = all_images[train_indices]
-        train_labels = all_labels[train_indices]
+            val_data = all_images[val_indices]
+            val_labels = all_labels[val_indices]
 
-        val_data = all_images[val_indices]
-        val_labels = all_labels[val_indices]
+            test_data = all_images[test_indices]
+            test_labels = all_labels[test_indices]
 
-        test_data = all_images[test_indices]
-        test_labels = all_labels[test_indices]
-
-        print(f"训练集大小: {len(train_indices)}")
-        print(f"验证集大小: {len(val_indices)}")
-        print(f"测试集大小: {len(test_indices)}")
+            emit(f"数据切分完成: train={len(train_indices)}, val={len(val_indices)}, test={len(test_indices)}")
 
         # 数据分区
         if is_iid:
-            print("使用IID数据分布")
+            emit("使用IID数据分布")
             # IID分区: 随机均匀分配
             indices = torch.randperm(len(train_data))
 
@@ -1511,9 +1722,9 @@ class DataManager:
                 user_train_data.append(user_data)
                 user_train_labels.append(user_labels)
 
-                print(f"客户端 {i}: 分配了 {len(user_data)} 个样本")
+                emit(f"客户端 {i}: 分配了 {len(user_data)} 个样本", verbose_only=True)
         else:
-            print(f"使用non-IID数据分布 (Dirichlet alpha={dirichlet_alpha})")
+            emit(f"使用non-IID数据分布 (Dirichlet alpha={dirichlet_alpha})")
 
             # 使用专用函数创建non-IID分区
             client_partitions = DataManager.create_non_iid_partition(
@@ -1533,9 +1744,9 @@ class DataManager:
 
                 # 打印每个客户端的样本分布
                 classes, counts = torch.unique(user_labels, return_counts=True)
-                print(f"客户端 {i}: 总样本数 = {len(user_labels)}")
+                emit(f"客户端 {i}: 总样本数 = {len(user_labels)}", verbose_only=True)
                 for c, count in zip(classes.tolist(), counts.tolist()):
-                    print(f"  类别 {c}: {count} 样本 ({count / len(user_labels) * 100:.1f}%)")
+                    emit(f"  类别 {c}: {count} 样本 ({count / len(user_labels) * 100:.1f}%)", verbose_only=True)
 
         # 应用标准化处理
         if dataset == 'mnist':
@@ -1560,6 +1771,13 @@ class DataManager:
                 user_train_data[i] = (user_train_data[i] - mean) / std
             val_data = (val_data - mean) / std
             test_data = (test_data - mean) / std
+        elif dataset == 'tiny-imagenet':
+            mean = torch.tensor([0.4802, 0.4481, 0.3975]).view(3, 1, 1)
+            std = torch.tensor([0.2302, 0.2265, 0.2262]).view(3, 1, 1)
+            for i in range(len(user_train_data)):
+                user_train_data[i] = (user_train_data[i] - mean) / std
+            val_data = (val_data - mean) / std
+            test_data = (test_data - mean) / std
 
         # 检查验证集和测试集的类别分布
         val_label_counts = {}
@@ -1569,13 +1787,18 @@ class DataManager:
             val_label_counts[label] = (val_labels == label).sum().item()
             test_label_counts[label] = (test_labels == label).sum().item()
 
-        print("\n验证集类别分布:")
-        for label, count in val_label_counts.items():
-            print(f"  类别 {label}: {count}样本 ({count / len(val_labels) * 100:.1f}%)")
+        emit(
+            f"验证集标签范围: min={min(val_label_counts.values())}, max={max(val_label_counts.values())}; "
+            f"测试集标签范围: min={min(test_label_counts.values())}, max={max(test_label_counts.values())}"
+        )
+        if config.data_debug_logging:
+            emit("\n验证集类别分布:")
+            for label, count in val_label_counts.items():
+                emit(f"  类别 {label}: {count}样本 ({count / len(val_labels) * 100:.1f}%)")
 
-        print("\n测试集类别分布:")
-        for label, count in test_label_counts.items():
-            print(f"  类别 {label}: {count}样本 ({count / len(test_labels) * 100:.1f}%)")
+            emit("\n测试集类别分布:")
+            for label, count in test_label_counts.items():
+                emit(f"  类别 {label}: {count}样本 ({count / len(test_labels) * 100:.1f}%)")
 
         # 确保数据类型正确
         for i in range(len(user_train_data)):
@@ -1589,15 +1812,19 @@ class DataManager:
         test_labels = test_labels.long()
 
         # 输出每个集合的形状和类型
-        print(f"\n用户训练数据: {len(user_train_data)} 个客户端")
-        print(f"用户0数据形状: {user_train_data[0].shape}, 类型: {user_train_data[0].dtype}")
-        print(f"用户0标签形状: {user_train_labels[0].shape}, 类型: {user_train_labels[0].dtype}")
-
-        print(f"验证数据形状: {val_data.shape}, 类型: {val_data.dtype}")
-        print(f"验证标签形状: {val_labels.shape}, 类型: {val_labels.dtype}")
-
-        print(f"测试数据形状: {test_data.shape}, 类型: {test_data.dtype}")
-        print(f"测试标签形状: {test_labels.shape}, 类型: {test_labels.dtype}")
+        client_sizes = [len(data) for data in user_train_data]
+        emit(
+            f"联邦数据准备完成: clients={len(user_train_data)}, "
+            f"client_samples[min/avg/max]={min(client_sizes)}/{np.mean(client_sizes):.1f}/{max(client_sizes)}, "
+            f"val_shape={tuple(val_data.shape)}, test_shape={tuple(test_data.shape)}"
+        )
+        if config.data_debug_logging:
+            emit(f"用户0数据形状: {user_train_data[0].shape}, 类型: {user_train_data[0].dtype}")
+            emit(f"用户0标签形状: {user_train_labels[0].shape}, 类型: {user_train_labels[0].dtype}")
+            emit(f"验证数据形状: {val_data.shape}, 类型: {val_data.dtype}")
+            emit(f"验证标签形状: {val_labels.shape}, 类型: {val_labels.dtype}")
+            emit(f"测试数据形状: {test_data.shape}, 类型: {test_data.dtype}")
+            emit(f"测试标签形状: {test_labels.shape}, 类型: {test_labels.dtype}")
 
         return user_train_data, user_train_labels, val_data, val_labels, test_data, test_labels
 # =========================================================
@@ -1881,14 +2108,33 @@ class FederatedLearning:
         """
         self.config = config
         self.device = config.device
+        self.verbose_logging = config.verbose_logging
+        self.model_debug_logging = config.model_debug_logging
+        self.save_all_snapshots = config.save_all_snapshots
         self.logger = LoggerFactory.setup_logger('federated_learning',
                                                  os.path.join(config.output_dir, 'logs'))
 
         # 记录配置信息
-        self.logger.info(f"初始化联邦学习系统 - 配置: {vars(config)}")
+        config_summary = {
+            'dataset': config.dataset,
+            'num_clients': config.num_clients,
+            'num_attackers': config.num_attackers,
+            'num_epochs': config.num_epochs,
+            'num_local_epochs': config.num_local_epochs,
+            'attack_type': config.attack_type,
+            'deviation_type': config.deviation_type,
+            'defense_enabled': config.defense_enabled,
+            'output_dir': config.output_dir,
+            'verbose_logging': config.verbose_logging
+        }
+        self.logger.info(f"初始化联邦学习系统 - 配置摘要: {config_summary}")
         self.logger.info(f"使用设备: {self.device}")
         # 初始化轮次计时统计
         self.round_overhead = {}  # 或使用 defaultdict: from collections import defaultdict; self.round_overhead = defaultdict(dict)
+
+    def _log_verbose(self, message: str) -> None:
+        if self.verbose_logging:
+            self.logger.info(message)
 
     def _fedavg_aggregate(self, global_model: nn.Module, client_models: List[nn.Module],
                           weights: List[float]) -> None:
@@ -1971,12 +2217,12 @@ class FederatedLearning:
                     global_model.load_state_dict(backup_state_dict)
                     return
 
-            self.logger.info("联邦平均聚合成功完成")
+            self._log_verbose("联邦平均聚合成功完成")
 
             # 打印一些聚合后参数的统计信息
             for key, param in list(global_model.state_dict().items())[:3]:  # 只打印前几个参数的统计信息
                 if param.numel() > 0:  # 确保参数不是空的
-                    self.logger.info(
+                    self._log_verbose(
                         f"参数 {key}: 均值={param.float().mean().item():.6f}, 标准差={param.float().std().item():.6f}, " +
                         f"最小值={param.float().min().item():.6f}, 最大值={param.float().max().item():.6f}")
 
@@ -2034,7 +2280,7 @@ class FederatedLearning:
                             last_layer_params[name] = param
 
             # 打印识别到的最后一层参数
-            if last_layer_params:
+            if last_layer_params and self.model_debug_logging:
                 self.logger.info(f"轮次 {epoch_num} {stage}时最后一层参数:")
                 for name, param in last_layer_params.items():
                     # 如果参数太大，只打印统计信息和前几个值
@@ -2051,7 +2297,7 @@ class FederatedLearning:
                     else:
                         # 如果参数较小，则打印全部值
                         self.logger.info(f"  {name}: {param.data.cpu().numpy().tolist()}")
-            else:
+            elif self.model_debug_logging:
                 self.logger.warning(f"轮次 {epoch_num} {stage}时无法识别最后一层参数")
 
 
@@ -2078,7 +2324,7 @@ class FederatedLearning:
         # 检查输入数据
         nusers = len(user_tr_data_tensors)
         self.logger.info(f"客户端总数: {nusers}")
-        self.logger.info(f"每个客户端训练数据大小: {user_tr_data_tensors[0].size()}")
+        self._log_verbose(f"每个客户端训练数据大小: {user_tr_data_tensors[0].size()}")
 
         if n_attackers > nusers:
             self.logger.warning(f"攻击者数量 ({n_attackers}) 超过了客户端总数 ({nusers})，设置为 {nusers - 1}")
@@ -2088,7 +2334,7 @@ class FederatedLearning:
         user_tr_len = user_tr_data_tensors[0].size(0)
         nbatches = (user_tr_len + batch_size - 1) // batch_size
         self.logger.info(f"每个客户端训练样本数: {user_tr_len}, 批次数: {nbatches}")
-        self.logger.info(f"客户端本地训练轮数: {num_local_epochs}")
+        self._log_verbose(f"客户端本地训练轮数: {num_local_epochs}")
 
         # 初始化模型和优化器
         fed_model, optimizer_fed = model_fn(self.config)
@@ -2102,14 +2348,17 @@ class FederatedLearning:
 
         # 初始化小波防御器
         input_shape = tuple(user_tr_data_tensors[0][0].size())
-        self.logger.info(f"输入形状: {input_shape}")
+        self._log_verbose(f"输入形状: {input_shape}")
         input_channels = input_shape[0]  # 获取通道数
 
         # 为不同数据集选择合适的小波防御器
         if self.config.dataset == 'fashion-mnist':
             self.wavelet_defender = self._create_fashion_mnist_defender(fed_model, nusers, input_shape)
         else:
-            self.wavelet_defender = WaveletDefense(fed_model, nusers, input_shape=input_shape, device=device)
+            self.wavelet_defender = WaveletDefense(
+                fed_model, nusers, input_shape=input_shape, device=device,
+                logger=self.logger, verbose=self.verbose_logging
+            )
 
         # 初始化防御评估器
         evaluator = DefenseEvaluator(n_attackers, nusers)
@@ -2125,11 +2374,9 @@ class FederatedLearning:
             'best_val_acc': 0,
             'best_test_acc': 0,
             'defense_stats': [],
-            'lr': []
+            'lr': [],
+            'attack_debug': []
         }
-
-        # 创建攻击函数
-        attack_fn = AttackFactory.create_attack(at_type, self.config)
 
         # 主训练循环
         epoch_num = 0
@@ -2139,7 +2386,7 @@ class FederatedLearning:
         max_epochs_without_improvement = 50  # 早停参数
 
         data_weights = [len(data) for data in user_tr_data_tensors]
-        self.logger.info(f"客户端数据量分布: {data_weights}")
+        self._log_verbose(f"客户端数据量分布: {data_weights}")
 
         start_time = time.time()
 
@@ -2147,7 +2394,7 @@ class FederatedLearning:
             """保存模型参数快照"""
             try:
                 torch.save(model.state_dict(), filename)
-                self.logger.info(f"已保存模型快照到 {filename}")
+                self._log_verbose(f"已保存模型快照到 {filename}")
             except Exception as e:
                 self.logger.error(f"保存模型快照失败: {str(e)}")
 
@@ -2165,7 +2412,7 @@ class FederatedLearning:
             max_norm = np.max(param_norms) if param_norms else 0
             min_norm = np.min(param_norms) if param_norms else 0
 
-            self.logger.info(
+            self._log_verbose(
                 f"{stage} 模型参数统计 - 总参数数量: {total_params}, 平均范数: {avg_norm:.6f}, 最大范数: {max_norm:.6f}, 最小范数: {min_norm:.6f}")
 
 
@@ -2190,7 +2437,8 @@ class FederatedLearning:
 
             # 保存当前轮次的模型
             current_model_path = os.path.join(self.config.output_dir, f"model_epoch_{epoch_num}.pth")
-            save_model_snapshot(fed_model, current_model_path)
+            if self.save_all_snapshots:
+                save_model_snapshot(fed_model, current_model_path)
 
             # 为每个客户端创建本地模型副本并训练
             all_client_models = []
@@ -2216,7 +2464,7 @@ class FederatedLearning:
                 is_malicious = i < n_attackers
                 client_type = "恶意" if is_malicious else "良性"
 
-                self.logger.info(f"训练客户端 {i} ({client_type})...")
+                self._log_verbose(f"训练客户端 {i} ({client_type})...")
 
                 # 训练客户端模型
                 if not is_malicious:  # 只训练良性客户端
@@ -2236,10 +2484,10 @@ class FederatedLearning:
 
                     if client_epoch_metrics:
                         final_metrics = client_epoch_metrics[-1]
-                        self.logger.info(
+                        self._log_verbose(
                             f"客户端 {i} 训练完成，平均损失: {client_loss:.4f}, 最终准确率: {final_metrics['accuracy']:.2f}%")
                     else:
-                        self.logger.info(f"客户端 {i} 训练完成，平均损失: {client_loss:.4f}")
+                        self._log_verbose(f"客户端 {i} 训练完成，平均损失: {client_loss:.4f}")
 
 
                 # 保存客户端模型和权重
@@ -2268,13 +2516,33 @@ class FederatedLearning:
                 # 计算良性客户端的平均参数向量
                 if len(benign_models_params) > 0:
                     benign_updates = torch.stack(benign_models_params)
-                    agg_params = torch.mean(benign_updates, 0)
 
                     # 提取当前全局模型参数
                     global_params = []
                     for param in fed_model.parameters():
                         global_params.append(param.data.view(-1))
                     global_params = torch.cat(global_params)
+
+                    attack_context = AttackContext(
+                        defender=self.wavelet_defender if at_type == "adaptive" else None,
+                        epoch_num=epoch_num,
+                        debug_store=history['attack_debug']
+                    )
+
+                    if at_type == "adaptive":
+                        try:
+                            benign_probed = self.wavelet_defender.generate_probing_parameters(benign_updates)
+                            attack_context.benign_feature_prototype = self.wavelet_defender.estimate_benign_feature_prototype(
+                                benign_updates,
+                                benign_probed
+                            )
+                            self._log_verbose(
+                                f"已估计自适应攻击良性特征原型，维度: {len(attack_context.benign_feature_prototype)}"
+                            )
+                        except Exception as e:
+                            self.logger.warning(f"估计良性特征原型失败，将退化为纯投毒目标: {str(e)}")
+
+                    attack_fn = AttackFactory.create_attack(at_type, self.config, attack_context)
 
                     # 对每个恶意客户端生成特定的恶意更新
                     for i in range(n_attackers):
@@ -2292,7 +2560,7 @@ class FederatedLearning:
                                 param.data = mal_update[idx:idx + param_size].reshape(param.shape).to(device)
                                 idx += param_size
 
-                            self.logger.info(f"为恶意客户端 {i} 生成了 {at_type} 攻击更新")
+                            self._log_verbose(f"为恶意客户端 {i} 生成了 {at_type} 攻击更新")
 
                         except Exception as e:
                             self.logger.error(f"恶意更新生成失败: {str(e)}")
@@ -2313,7 +2581,7 @@ class FederatedLearning:
 
             # 生成诱导参数
             probed_updates = self.wavelet_defender.generate_probing_parameters(all_client_params_tensor)
-            self.logger.info(f"生成诱导参数完成，形状: {probed_updates.shape}")
+            self._log_verbose(f"生成诱导参数完成，形状: {probed_updates.shape}")
 
             # 检测恶意客户端
             try:
@@ -2325,7 +2593,7 @@ class FederatedLearning:
 
                 # 选择被参与聚合的客户端索引
                 selected_indices = [i for i in range(len(all_client_models)) if i not in malicious_indices]
-                self.logger.info(f"选中的客户端索引: {selected_indices}")
+                self._log_verbose(f"选中的客户端索引: {selected_indices}")
 
                 # 评估防御效果
                 defense_stats = evaluator.evaluate_round(selected_indices, malicious_indices, epoch_num)
@@ -2364,7 +2632,8 @@ class FederatedLearning:
 
                 # 保存聚合后的全局模型
                 aggregated_model_path = os.path.join(self.config.output_dir, f"model_aggregated_epoch_{epoch_num}.pth")
-                save_model_snapshot(fed_model, aggregated_model_path)
+                if self.save_all_snapshots:
+                    save_model_snapshot(fed_model, aggregated_model_path)
             else:
                 self.logger.warning("没有选中任何客户端进行聚合！保持全局模型不变")
 
@@ -2375,7 +2644,7 @@ class FederatedLearning:
             # 更新学习率
             lr_changed = scheduler.step(epoch_num)
             if lr_changed:
-                self.logger.info(f"学习率更新为: {scheduler.get_last_lr()[0]}")
+                self._log_verbose(f"学习率更新为: {scheduler.get_last_lr()[0]}")
 
             # 记录当前学习率
             history['lr'].append(scheduler.get_last_lr()[0])
@@ -2445,7 +2714,7 @@ class FederatedLearning:
             self.logger.info(f"测试集: 损失 = {test_loss:.4f}, 准确率 = {test_acc:.2f}%")
 
             # 添加诊断信息
-            self.logger.info("全局模型评估诊断:")
+            self._log_verbose("全局模型评估诊断:")
             # 随机抽样5个样本输出预测值与真实值比较
             with torch.no_grad():
                 random_indices = torch.randperm(len(val_data_tensor))[:5]
@@ -2456,8 +2725,10 @@ class FederatedLearning:
                 _, sample_preds = torch.max(sample_outputs, 1)
 
                 for i in range(len(random_indices)):
-                    self.logger.info(f"样本 {i}: 预测 = {sample_preds[i].item()}, 真实 = {sample_targets[i].item()}, " +
-                                     f"{'正确' if sample_preds[i] == sample_targets[i] else '错误'}")
+                    self._log_verbose(
+                        f"样本 {i}: 预测 = {sample_preds[i].item()}, 真实 = {sample_targets[i].item()}, "
+                        f"{'正确' if sample_preds[i] == sample_targets[i] else '错误'}"
+                    )
             # 更新历史记录
             history['epoch'].append(epoch_num)
             history['train_loss'].append(train_loss)
@@ -2486,7 +2757,7 @@ class FederatedLearning:
                 epochs_without_improvement = 0
             else:
                 epochs_without_improvement += 1
-                self.logger.info(f"模型性能未提升，已经{epochs_without_improvement}轮未改善")
+                self._log_verbose(f"模型性能未提升，已经{epochs_without_improvement}轮未改善")
 
             # 早停检查
             if epochs_without_improvement >= max_epochs_without_improvement:
@@ -2495,12 +2766,15 @@ class FederatedLearning:
 
             # 计算轮次耗时
             epoch_time = time.time() - epoch_start_time
-            self.logger.info(f"轮次{epoch_num}完成，耗时: {epoch_time:.2f}秒")
+            self.logger.info(
+                f"轮次 {epoch_num} 总结: train_loss={train_loss:.4f}, val_acc={val_acc:.2f}%, "
+                f"test_acc={test_acc:.2f}%, detected={len(malicious_indices)}, 耗时={epoch_time:.2f}秒"
+            )
 
             # 定期清理GPU内存
             if torch.cuda.is_available() and epoch_num % 10 == 0:
                 torch.cuda.empty_cache()
-                self.logger.info("已清理GPU缓存")
+                self._log_verbose("已清理GPU缓存")
 
             round_compute_time = time.time() - round_start_time
             self.round_overhead[f"epoch_{epoch_num}"] = {
@@ -2511,7 +2785,7 @@ class FederatedLearning:
                 "validation_accuracy": val_acc,
                 "test_accuracy": test_acc
             }
-            self.logger.info(f"轮次 {epoch_num} 完成，耗时: {round_compute_time:.2f} 秒")
+            self._log_verbose(f"轮次 {epoch_num} 完成，耗时: {round_compute_time:.2f} 秒")
 
             epoch_num += 1
 
@@ -2684,7 +2958,7 @@ class FederatedLearning:
                     'correct': epoch_correct,
                     'total': epoch_total
                 })
-                self.logger.info(
+                self._log_verbose(
                     f"  - 本地轮次 {local_epoch}/{num_local_epochs - 1}: 损失 = {epoch_avg_loss:.4f}, 准确率 = {epoch_accuracy:.2f}%")
 
         # 计算客户端平均损失
@@ -2735,7 +3009,7 @@ class FederatedLearning:
                     try:
                         # 创建批次大小为2的假输入数据
                         fake_input = torch.randn(2, *self.input_shape).to(self.device)
-                        fake_target = torch.randint(0, 10, (2,)).to(self.device)
+                        fake_target = torch.randint(0, self._infer_num_classes(), (2,)).to(self.device)
 
                         # 计算FGSM扰动
                         self.model.zero_grad()
@@ -2768,7 +3042,7 @@ class FederatedLearning:
                         probing_params.append(probed_update)
 
                     except Exception as e:
-                        print(f"生成诱导参数时出错: {str(e)}")
+                        self._log(f"生成诱导参数时出错，回退到随机噪声: {str(e)}", level="warning")
                         random_noise = torch.randn_like(update) * self.epsilon
                         probed_update = update + random_noise
                         probing_params.append(probed_update)
@@ -2780,7 +3054,10 @@ class FederatedLearning:
                 self.execution_time['generate_probing'] = time.time() - start_time
                 return torch.stack(probing_params)
 
-        return CustomWaveletDefender(model, nusers, input_shape=input_shape, device=self.device)
+        return CustomWaveletDefender(
+            model, nusers, input_shape=input_shape, device=self.device,
+            logger=self.logger, verbose=self.verbose_logging
+        )
 
     @staticmethod
     def _convert_to_serializable(obj):
@@ -2867,6 +3144,13 @@ class FederatedLearning:
                 num_local_epochs=self.config.num_local_epochs,
                 attack_type=at_type,
                 deviation_type=dev_type,
+                adaptive_attack_weight=self.config.adaptive_attack_weight,
+                adaptive_scale_candidates=self.config.adaptive_scale_candidates,
+                attack_debug_enabled=self.config.attack_debug_enabled,
+                verbose_logging=self.config.verbose_logging,
+                data_debug_logging=self.config.data_debug_logging,
+                model_debug_logging=self.config.model_debug_logging,
+                save_all_snapshots=self.config.save_all_snapshots,
                 defense_enabled=self.config.defense_enabled,
                 seed=self.config.seed + i,  # 不同实验使用不同的种子
                 output_dir=exp_dir,
@@ -2985,7 +3269,7 @@ def main():
         config)
 
     # 可视化客户端数据分布
-    num_classes = 10  # CIFAR-10有10个类别
+    num_classes = config.num_classes
     DataManager.visualize_label_distribution(
         user_tr_label_tensors,
         num_classes,

@@ -29,7 +29,7 @@ class WaveletDefense:
 
     def __init__(self, model, num_clients, input_shape=(1, 28, 28), wavelet='db4',
                  epsilon=0.1, eps=0.01, min_samples=2, num_features=None, device=None,
-                 clustering_method='kmeans'):
+                 clustering_method='kmeans', logger=None, verbose=False):
         """
         初始化小波防御机制
 
@@ -56,6 +56,8 @@ class WaveletDefense:
         self.device = device if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.scaler = StandardScaler()
         self.clustering_method = clustering_method
+        self.logger = logger
+        self.verbose = verbose
 
         # 性能指标
         self.detection_stats = []
@@ -73,6 +75,78 @@ class WaveletDefense:
 
         self.client_overhead = {}
         self.current_epoch = 0  # 添加当前轮次记录
+
+    def _log(self, message, level="info", verbose_only=False):
+        if verbose_only and not self.verbose:
+            return
+
+        if self.logger is not None:
+            log_fn = getattr(self.logger, level, self.logger.info)
+            log_fn(message)
+        else:
+            print(message)
+
+    def _infer_num_classes(self) -> int:
+        """尽量从模型中推断输出类别数。"""
+        for module in reversed(list(self.model.modules())):
+            if hasattr(module, "out_features"):
+                return int(module.out_features)
+        return 10
+
+    def extract_feature_differences(self, original_updates, probed_updates):
+        """
+        提取原始更新与诱导更新之间的频域差分特征。
+
+        Args:
+            original_updates: 原始客户端更新 [num_clients, update_dim]
+            probed_updates: 诱导后的客户端更新 [num_clients, update_dim]
+
+        Returns:
+            np.ndarray: 差分特征矩阵 [num_clients, num_features]
+        """
+        feature_vectors = []
+
+        for i, (orig_update, probed_update) in enumerate(zip(original_updates, probed_updates)):
+            orig_coeffs = self.wavelet_transform(orig_update)
+            orig_features = self.extract_wavelet_features(orig_coeffs)
+
+            probed_coeffs = self.wavelet_transform(probed_update)
+            probed_features = self.extract_wavelet_features(probed_coeffs)
+
+            feature_diff = np.abs(probed_features - orig_features)
+            if np.isnan(feature_diff).any() or np.isinf(feature_diff).any():
+                print(f"客户端 {i} 的特征包含无效值，使用零替代")
+                feature_diff = np.zeros_like(feature_diff)
+
+            feature_vectors.append(feature_diff)
+
+        return np.array(feature_vectors)
+
+    def estimate_benign_feature_prototype(self, client_updates, probed_updates, benign_indices=None):
+        """
+        估计良性客户端在防御特征空间中的原型向量。
+
+        Args:
+            client_updates: 原始客户端更新
+            probed_updates: 诱导后的客户端更新
+            benign_indices: 良性客户端索引；若为None，则使用全部客户端
+
+        Returns:
+            np.ndarray: 良性原型特征
+        """
+        feature_vectors = self.extract_feature_differences(client_updates, probed_updates)
+        if len(feature_vectors) == 0:
+            return np.array([])
+
+        if benign_indices is None:
+            benign_vectors = feature_vectors
+        else:
+            benign_vectors = feature_vectors[benign_indices]
+
+        if len(benign_vectors) == 0:
+            return np.array([])
+
+        return np.mean(benign_vectors, axis=0)
 
     def record_client_overhead(self, client_id, compute_time, model_size_kb):
         """
@@ -121,11 +195,11 @@ class WaveletDefense:
             kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
             labels = kmeans.fit_predict(feature_vectors)
 
-            print(f"KMeans聚类完成, 聚类数={n_clusters}")
+            self._log(f"KMeans聚类完成, 聚类数={n_clusters}", verbose_only=True)
             return labels
 
         except Exception as e:
-            print(f"KMeans聚类出错: {str(e)}")
+            self._log(f"KMeans聚类出错: {str(e)}", level="warning")
             # 失败时返回所有点为一类
             return np.zeros(len(feature_vectors), dtype=int)
 
@@ -151,11 +225,11 @@ class WaveletDefense:
                                             random_state=42)
             labels = clustering.fit_predict(feature_vectors)
 
-            print(f"谱聚类完成, 聚类数={n_clusters}")
+            self._log(f"谱聚类完成, 聚类数={n_clusters}", verbose_only=True)
             return labels
 
         except Exception as e:
-            print(f"谱聚类出错: {str(e)}")
+            self._log(f"谱聚类出错: {str(e)}", level="warning")
             # 失败时返回所有点为一类
             return np.zeros(len(feature_vectors), dtype=int)
 
@@ -179,11 +253,11 @@ class WaveletDefense:
             clustering = AgglomerativeClustering(n_clusters=n_clusters)
             labels = clustering.fit_predict(feature_vectors)
 
-            print(f"层次聚类完成, 聚类数={n_clusters}")
+            self._log(f"层次聚类完成, 聚类数={n_clusters}", verbose_only=True)
             return labels
 
         except Exception as e:
-            print(f"层次聚类出错: {str(e)}")
+            self._log(f"层次聚类出错: {str(e)}", level="warning")
             # 失败时返回所有点为一类
             return np.zeros(len(feature_vectors), dtype=int)
 
@@ -210,11 +284,11 @@ class WaveletDefense:
             labels = np.zeros(len(feature_vectors_2d), dtype=int)
             labels[y_values > threshold] = 1
 
-            print(f"基于阈值的聚类完成, 阈值={threshold:.4f}, 类别1大小={np.sum(labels == 1)}")
+            self._log(f"基于阈值的聚类完成, 阈值={threshold:.4f}, 类别1大小={np.sum(labels == 1)}", verbose_only=True)
             return labels
 
         except Exception as e:
-            print(f"基于阈值的聚类出错: {str(e)}")
+            self._log(f"基于阈值的聚类出错: {str(e)}", level="warning")
             # 失败时返回所有点为一类
             return np.zeros(len(feature_vectors_2d), dtype=int)
 
@@ -280,11 +354,11 @@ class WaveletDefense:
                 if labels[i] == -1:  # 如果尚未分配
                     labels[i] = labels[nneigh[i]]
 
-            print(f"密度峰值聚类完成, 聚类数={n_clusters}")
+            self._log(f"密度峰值聚类完成, 聚类数={n_clusters}", verbose_only=True)
             return labels
 
         except Exception as e:
-            print(f"密度峰值聚类出错: {str(e)}")
+            self._log(f"密度峰值聚类出错: {str(e)}", level="warning")
             # 失败时返回所有点为一类
             return np.zeros(len(feature_vectors), dtype=int)
 
@@ -358,11 +432,11 @@ class WaveletDefense:
             threshold = len(normalized_results) / 2  # 多数票
             final_labels[ensemble_result > threshold] = 1
 
-            print(f"集成聚类完成, 使用了{len(normalized_results)}种方法, 类别1大小={np.sum(final_labels == 1)}")
+            self._log(f"集成聚类完成, 使用了{len(normalized_results)}种方法, 类别1大小={np.sum(final_labels == 1)}", verbose_only=True)
             return final_labels
 
         except Exception as e:
-            print(f"集成聚类出错: {str(e)}")
+            self._log(f"集成聚类出错: {str(e)}", level="warning")
             # 失败时使用基于阈值的方法
             return self._threshold_based_clustering(feature_vectors_2d)
 
@@ -868,16 +942,20 @@ class WaveletDefense:
             return
 
         df = pd.DataFrame(self.detection_stats)
+        epochs = df['epoch'].to_numpy()
+        detected = df['detected_malicious'].to_numpy()
+        benign_cluster_size = df['benign_cluster_size'].to_numpy()
+        total_clients = df['total_clients'].to_numpy()
 
         plt.figure(figsize=(15, 10))
 
         # 检测统计
         plt.subplot(2, 2, 1)
-        plt.plot(df['epoch'], df['detected_malicious'], marker='o', label='检测为恶意')
-        plt.plot(df['epoch'], df['benign_cluster_size'], marker='s', label='良性簇大小')
+        plt.plot(epochs, detected, marker='o', label='检测为恶意')
+        plt.plot(epochs, benign_cluster_size, marker='s', label='良性簇大小')
         if 'noise_points' in df.columns:
-            plt.plot(df['epoch'], df['noise_points'], marker='^', label='噪声点')
-        plt.plot(df['epoch'], df['total_clients'], '--', label='总客户端数')
+            plt.plot(epochs, df['noise_points'].to_numpy(), marker='^', label='噪声点')
+        plt.plot(epochs, total_clients, '--', label='总客户端数')
         plt.xlabel('训练轮次')
         plt.ylabel('客户端数量')
         plt.title('检测统计')
@@ -909,12 +987,42 @@ class WaveletDefense:
 
             # 精确率、召回率和F1分数
             plt.subplot(2, 2, 2)
-            plt.plot(df['epoch'], precision, marker='o', label='精确率')
-            plt.plot(df['epoch'], recall, marker='s', label='召回率')
-            plt.plot(df['epoch'], f1_score, marker='^', label='F1分数')
+            plt.plot(epochs, precision, marker='o', label='精确率')
+            plt.plot(epochs, recall, marker='s', label='召回率')
+            plt.plot(epochs, f1_score, marker='^', label='F1分数')
             plt.xlabel('训练轮次')
             plt.ylabel('值')
             plt.title('检测性能指标')
+            plt.legend()
+            plt.grid(True, linestyle='--', alpha=0.7)
+
+        # 聚类质量
+        if self.clustering_quality:
+            quality_df = pd.DataFrame(self.clustering_quality)
+            quality_epochs = quality_df['epoch'].to_numpy()
+
+            plt.subplot(2, 2, 3)
+            plt.plot(quality_epochs, quality_df['n_clusters'].to_numpy(), marker='o', label='聚类数量')
+            if 'noise_ratio' in quality_df.columns:
+                plt.plot(quality_epochs, quality_df['noise_ratio'].to_numpy(), marker='s', label='噪声比例')
+            plt.xlabel('训练轮次')
+            plt.ylabel('值')
+            plt.title('聚类特性')
+            plt.legend()
+            plt.grid(True, linestyle='--', alpha=0.7)
+
+            plt.subplot(2, 2, 4)
+            valid_silhouette = quality_df[quality_df['silhouette'] > -1]
+            if not valid_silhouette.empty:
+                plt.plot(valid_silhouette['epoch'].to_numpy(), valid_silhouette['silhouette'].to_numpy(),
+                         marker='o', label='轮廓系数')
+            valid_ch = quality_df[quality_df['ch_score'] > -1]
+            if not valid_ch.empty:
+                plt.plot(valid_ch['epoch'].to_numpy(), (valid_ch['ch_score'] / 100).to_numpy(),
+                         marker='s', label='CH分数 (/100)')
+            plt.xlabel('训练轮次')
+            plt.ylabel('分数')
+            plt.title('聚类质量')
             plt.legend()
             plt.grid(True, linestyle='--', alpha=0.7)
 
@@ -1407,7 +1515,7 @@ class WaveletDefense:
             try:
                 # 创建假输入数据
                 fake_input = torch.randn(1, *self.input_shape).to(self.device)
-                fake_target = torch.randint(0, 10, (1,)).to(self.device)
+                fake_target = torch.randint(0, self._infer_num_classes(), (1,)).to(self.device)
 
                 # 计算FGSM扰动
                 self.model.zero_grad()
@@ -1436,7 +1544,7 @@ class WaveletDefense:
                 probing_params.append(probed_update)
 
             except Exception as e:
-                print(f"生成诱导参数时出错: {str(e)}")
+                self._log(f"生成诱导参数时出错，回退到随机噪声: {str(e)}", level="warning")
                 # 如果生成失败，使用原始更新加上随机噪声
                 random_noise = torch.randn_like(update) * self.epsilon
                 probed_update = update + random_noise
@@ -1460,35 +1568,15 @@ class WaveletDefense:
         """
         start_time = time.time()
         try:
-            feature_vectors = []
+            feature_vectors = self.extract_feature_differences(original_updates, probed_updates)
             normalized_feature_vectors = []
-
-            # 为每个客户端提取特征
-            for i, (orig_update, probed_update) in enumerate(zip(original_updates, probed_updates)):
-                # 计算原始更新的小波特征
-                orig_coeffs = self.wavelet_transform(orig_update)
-                orig_features = self.extract_wavelet_features(orig_coeffs)
-
-                # 计算诱导后更新的小波特征
-                probed_coeffs = self.wavelet_transform(probed_update)
-                probed_features = self.extract_wavelet_features(probed_coeffs)
-
-                # 计算特征差异并归一化
-                feature_diff = np.abs(probed_features - orig_features)
-
-                # 检查特征是否包含无效值
-                if np.isnan(feature_diff).any() or np.isinf(feature_diff).any():
-                    print(f"客户端 {i} 的特征包含无效值，使用零替代")
-                    feature_diff = np.zeros_like(feature_diff)
-
-                feature_vectors.append(feature_diff)
 
             # 标准化特征
             if len(feature_vectors) > 0:
                 try:
                     normalized_feature_vectors = self.scaler.fit_transform(feature_vectors)
                 except Exception as e:
-                    print(f"特征标准化失败: {str(e)}")
+                    self._log(f"特征标准化失败，回退到min-max归一化: {str(e)}", level="warning")
                     # 如果标准化失败，使用简单的min-max归一化
                     feature_vectors = np.array(feature_vectors)
                     feature_max = np.max(feature_vectors, axis=0)
@@ -1503,7 +1591,7 @@ class WaveletDefense:
                 # 将特征值限制在合理范围内
                 normalized_feature_vectors = np.clip(normalized_feature_vectors, -5, 5)
             else:
-                print("没有有效的特征向量，返回空列表")
+                self._log("没有有效的特征向量，返回空列表", level="warning")
                 return []
 
             # 先使用PCA降维，然后再进行聚类（关键修改部分）
@@ -1515,9 +1603,9 @@ class WaveletDefense:
             try:
                 feature_vectors_2d = pca.fit_transform(normalized_feature_vectors)
                 explained_variance = np.sum(pca.explained_variance_ratio_)
-                print(f"PCA解释方差比例: {explained_variance:.2%}")
+                self._log(f"轮次 {epoch_num} PCA解释方差比例: {explained_variance:.2%}", verbose_only=True)
             except Exception as e:
-                print(f"PCA降维失败: {str(e)}")
+                self._log(f"PCA降维失败，回退到前两维特征: {str(e)}", level="warning")
                 # 如果PCA失败，使用原始特征的前两个维度
                 if normalized_feature_vectors.shape[1] >= 2:
                     feature_vectors_2d = normalized_feature_vectors[:, :2]
@@ -1549,13 +1637,12 @@ class WaveletDefense:
 
                 self.epoch_numbers.append(epoch_num)
 
-                # 打印真实客户端代表值统计
-                print("\n=== 真实客户端代表值统计 ===")
-                print(f"轮次 {epoch_num}:")
-                print(f"真实良性客户端代表值均值: {self.benign_rep_values_history[-1]:.4f}")
-                print(f"真实恶意客户端代表值均值: {self.malicious_rep_values_history[-1]:.4f}")
-                print(
-                    f"真实代表值差异: {self.malicious_rep_values_history[-1] - self.benign_rep_values_history[-1]:.4f}")
+                self._log(
+                    f"轮次 {epoch_num} 特征代表值统计: 良性均值={self.benign_rep_values_history[-1]:.4f}, "
+                    f"恶意均值={self.malicious_rep_values_history[-1]:.4f}, "
+                    f"差异={self.malicious_rep_values_history[-1] - self.benign_rep_values_history[-1]:.4f}",
+                    verbose_only=True
+                )
 
 
             # 使用降维后的特征向量进行聚类（关键修改部分）
@@ -1566,7 +1653,7 @@ class WaveletDefense:
             else:
                 method = self.clustering_method
 
-            print(f"选择的聚类方法: {method}")
+            self._log(f"轮次 {epoch_num} 选择的聚类方法: {method}", verbose_only=True)
 
             # 根据选择的方法执行聚类，使用降维后的特征向量（关键修改部分）
             if method == 'dbscan':
@@ -1597,7 +1684,7 @@ class WaveletDefense:
             unique_labels = np.unique(labels)
             n_clusters = len(unique_labels) - (1 if -1 in unique_labels else 0)
 
-            print(f"聚类数量: {n_clusters}")
+            self._log(f"轮次 {epoch_num} 聚类数量: {n_clusters}", verbose_only=True)
 
             if n_clusters > 1 and n_clusters < len(labels):
                 try:
@@ -1612,10 +1699,9 @@ class WaveletDefense:
                     # Calinski-Harabasz分数
                     ch_score = calinski_harabasz_score(feature_vectors_2d, labels)  # 使用降维后的特征（关键修改部分）
 
-                    print(f"轮廓系数: {silhouette_avg:.3f}")
-                    print(f"Calinski-Harabasz分数: {ch_score:.1f}")
+                    self._log(f"轮次 {epoch_num} 聚类质量: silhouette={silhouette_avg:.3f}, CH={ch_score:.1f}", verbose_only=True)
                 except Exception as e:
-                    print(f"计算聚类质量指标出错: {str(e)}")
+                    self._log(f"计算聚类质量指标出错: {str(e)}", level="warning")
 
             # 记录聚类质量指标
             self.clustering_quality.append({
@@ -1629,7 +1715,7 @@ class WaveletDefense:
 
             # 如果所有点都是单独的簇或全是噪声点，使用基于差分向量模长的方法
             if n_clusters <= 1 or n_clusters >= len(labels) * 0.8:
-                print("聚类失败：簇数量不合理，使用基于差分向量模长的方法")
+                self._log("聚类失败：簇数量不合理，使用基于差分向量模长的方法", level="warning")
                 return self._norm_based_detection(feature_vectors)
 
             # 计算每个簇的代表值
@@ -1651,14 +1737,11 @@ class WaveletDefense:
 
             # 如果没有有效的簇，使用距离分析
             if not cluster_representatives:
-                print("未找到有效的簇，使用距离分析方法")
+                self._log("未找到有效的簇，使用距离分析方法", level="warning")
                 return self._statistical_outlier_detection(feature_vectors_2d)  # 使用降维后的特征（关键修改部分）
-
-            # 打印每个簇的代表值
-            print("\n=== 簇代表值 ===")
             for label, value in sorted(cluster_representatives.items(), key=lambda x: x[1], reverse=True):
                 cluster_size = np.sum(labels == label)
-                print(f"簇 {label}: 大小 = {cluster_size}, 代表值 = {value:.4f}")
+                self._log(f"轮次 {epoch_num} 簇 {label}: 大小={cluster_size}, 代表值={value:.4f}", verbose_only=True)
 
             # 分析特征重要性
             if len(unique_labels) > 1:
@@ -1666,14 +1749,17 @@ class WaveletDefense:
 
             # 选择具有最高代表值的簇作为良性客户端群体
             benign_cluster = min(cluster_representatives, key=cluster_representatives.get)
-            print(f"\n选择的良性簇: {benign_cluster}, 代表值: {cluster_representatives[benign_cluster]:.4f}")
+            self._log(
+                f"轮次 {epoch_num} 选择良性簇 {benign_cluster}，代表值={cluster_representatives[benign_cluster]:.4f}",
+                verbose_only=True
+            )
 
             # 将不在良性簇中的客户端标记为恶意
             malicious_indices = [i for i in range(len(labels)) if labels[i] != benign_cluster]
 
             # 如果所有客户端都被标记为恶意，选择其中一部分作为良性
             if len(malicious_indices) == len(labels):
-                print("警告: 所有客户端都被标记为恶意，基于差分向量模长选择部分作为良性")
+                self._log("所有客户端都被标记为恶意，回退到基于差分向量模长的选择", level="warning")
                 return self._norm_based_detection(feature_vectors)
 
             # 保存检测统计信息
@@ -1689,20 +1775,20 @@ class WaveletDefense:
             # 缓存本轮检测的恶意客户端索引
             self.malicious_indices_cache[epoch_num] = malicious_indices
 
-            # 打印详细的检测信息
-            print("\n=== 检测结果 ===")
-            print(f"总客户端数: {len(labels)}")
-            print(f"被检测为恶意的客户端数: {len(malicious_indices)}")
-            print(f"良性簇大小: {np.sum(labels == benign_cluster)}")
-            print(f"噪声点数量: {np.sum(labels == -1) if -1 in labels else 0}")
+            self._log(
+                f"轮次 {epoch_num} 检测完成: 恶意客户端={len(malicious_indices)}, "
+                f"良性簇大小={np.sum(labels == benign_cluster)}, "
+                f"噪声点={np.sum(labels == -1) if -1 in labels else 0}"
+            )
 
             self.execution_time['detection'] = time.time() - start_time
             return malicious_indices
 
         except Exception as e:
-            print(f"检测恶意客户端时发生错误: {str(e)}")
+            self._log(f"检测恶意客户端时发生错误: {str(e)}", level="error")
             # 如果检测过程失败，使用基于差分向量模长的方法
-            traceback.print_exc()  # 打印详细的错误堆栈
+            if self.verbose:
+                traceback.print_exc()  # 打印详细的错误堆栈
             # 如果检测过程失败，使用基于差分向量模长的方法
             if 'feature_vectors' in locals() and len(feature_vectors) > 0:
                 return self._norm_based_detection(np.array(feature_vectors))
@@ -1711,29 +1797,3 @@ class WaveletDefense:
                 n_clients = len(original_updates)
                 n_select = max(1, int(n_clients * 0.1))
                 return np.random.choice(n_clients, n_select, replace=False).tolist()
-
-        # 聚类质量
-        if self.clustering_quality:
-            quality_df = pd.DataFrame(self.clustering_quality)
-            plt.subplot(2, 2, 3)
-            plt.plot(quality_df['epoch'], quality_df['n_clusters'], marker='o', label='聚类数量')
-            if 'noise_ratio' in quality_df.columns:
-                plt.plot(quality_df['epoch'], quality_df['noise_ratio'], marker='s', label='噪声比例')
-            plt.xlabel('训练轮次')
-            plt.ylabel('值')
-            plt.title('聚类特性')
-            plt.legend()
-            plt.grid(True, linestyle='--', alpha=0.7)
-
-            plt.subplot(2, 2, 4)
-            valid_silhouette = quality_df[quality_df['silhouette'] > -1]
-            if not valid_silhouette.empty:
-                plt.plot(valid_silhouette['epoch'], valid_silhouette['silhouette'], marker='o', label='轮廓系数')
-            valid_ch = quality_df[quality_df['ch_score'] > -1]
-            if not valid_ch.empty:
-                plt.plot(valid_ch['epoch'], valid_ch['ch_score'] / 100, marker='s', label='CH分数 (/100)')  # 缩放以适应图表
-            plt.xlabel('训练轮次')
-            plt.ylabel('分数')
-            plt.title('聚类质量')
-            plt.legend()
-            plt.grid(True, linestyle='--', alpha=0.7)
